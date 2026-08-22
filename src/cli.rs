@@ -1,0 +1,182 @@
+use std::{num::NonZeroUsize, path::PathBuf, str::FromStr};
+
+use clap::{Parser, ValueHint};
+
+use crate::{Error, Result, plan::Bounds};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "image-reducer",
+    version,
+    about = "Safely downscale images that exceed orientation-aware bounds"
+)]
+pub struct Cli {
+    /// Directory containing source images
+    #[arg(value_hint = ValueHint::DirPath)]
+    pub source: PathBuf,
+
+    /// Landscape-oriented maximum dimensions, such as 1920x1080
+    #[arg(long, value_name = "WIDTHxHEIGHT")]
+    pub max: Option<Bounds>,
+
+    /// Write reduced images beneath this new directory
+    #[arg(long, value_hint = ValueHint::DirPath, conflicts_with = "replace")]
+    pub output: Option<PathBuf>,
+
+    /// Transactionally replace source images after verification
+    #[arg(long, conflicts_with = "output")]
+    pub replace: bool,
+
+    /// Exclude an exact source-relative directory and its subtree
+    #[arg(long, value_name = "RELATIVE_DIRECTORY", value_hint = ValueHint::DirPath)]
+    pub exclude: Vec<PathBuf>,
+
+    /// Lossy encoding quality
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub quality: Option<u8>,
+
+    /// Retain supported location and other metadata
+    #[arg(long)]
+    pub preserve_all_metadata: bool,
+
+    /// Discover and report planned work without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Approve replacement without an interactive prompt
+    #[arg(long, requires = "replace")]
+    pub yes: bool,
+
+    /// Maximum number of concurrent image-processing workers
+    #[arg(long)]
+    pub jobs: Option<NonZeroUsize>,
+
+    /// Emit a structured JSON report
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl Cli {
+    pub fn validate(&self) -> Result<()> {
+        let metadata = std::fs::metadata(&self.source).map_err(|source| Error::Io {
+            path: self.source.clone(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            return Err(Error::InvalidArgument(format!(
+                "source is not a directory: {}",
+                self.source.display()
+            )));
+        }
+
+        if self.source.is_symlink() {
+            return Err(Error::InvalidArgument(format!(
+                "source directory must not be a symbolic link: {}",
+                self.source.display()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_exclusion(path: &std::path::Path) -> Result<()> {
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(Error::InvalidArgument(format!(
+            "exclusion must be a non-empty source-relative path: {}",
+            path.display()
+        )));
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(Error::InvalidArgument(format!(
+            "exclusion must remain inside the source directory: {}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+impl FromStr for Bounds {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (width, height) = value
+            .split_once(['x', 'X', '×'])
+            .ok_or_else(|| "expected WIDTHxHEIGHT".to_owned())?;
+        let width = width
+            .parse::<u32>()
+            .map_err(|_| "width must be a positive integer".to_owned())?;
+        let height = height
+            .parse::<u32>()
+            .map_err(|_| "height must be a positive integer".to_owned())?;
+        Bounds::new(width, height).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parses_complete_command_line() {
+        let cli = Cli::try_parse_from([
+            "image-reducer",
+            "/pictures",
+            "--max",
+            "2560x1440",
+            "--exclude",
+            "cache/thumbnails",
+            "--quality",
+            "90",
+            "--jobs",
+            "4",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.max, Some(Bounds::new(2560, 1440).unwrap()));
+        assert_eq!(cli.exclude, [PathBuf::from("cache/thumbnails")]);
+        assert_eq!(cli.jobs.unwrap().get(), 4);
+        assert!(cli.dry_run);
+        assert!(cli.json);
+    }
+
+    #[test]
+    fn rejects_portrait_custom_bounds() {
+        let error =
+            Cli::try_parse_from(["image-reducer", "/pictures", "--max", "800x1200"]).unwrap_err();
+
+        assert!(error.to_string().contains("landscape-oriented"));
+    }
+
+    #[test]
+    fn rejects_output_with_replacement() {
+        assert!(
+            Cli::try_parse_from([
+                "image-reducer",
+                "/pictures",
+                "--output",
+                "/reduced",
+                "--replace"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_parent_directory_exclusion() {
+        assert!(validate_exclusion(std::path::Path::new("../elsewhere")).is_err());
+    }
+}
