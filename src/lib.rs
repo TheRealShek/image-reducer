@@ -2,6 +2,7 @@ pub mod cli;
 pub mod discovery;
 pub mod inspection;
 pub mod plan;
+pub mod processing;
 
 use std::path::PathBuf;
 
