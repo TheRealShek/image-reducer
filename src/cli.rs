@@ -1,4 +1,8 @@
-use std::{num::NonZeroUsize, path::PathBuf, str::FromStr};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use clap::{Parser, ValueHint};
 
@@ -50,6 +54,10 @@ pub struct Cli {
     /// Maximum number of concurrent image-processing workers
     #[arg(long)]
     pub jobs: Option<NonZeroUsize>,
+
+    /// Maximum decoded pixels allowed per image
+    #[arg(long, value_name = "PIXELS")]
+    pub max_pixels: Option<NonZeroU64>,
 
     /// Emit a structured JSON report
     #[arg(long)]
@@ -141,6 +149,8 @@ mod tests {
             "90",
             "--jobs",
             "4",
+            "--max-pixels",
+            "50000000",
             "--dry-run",
             "--json",
         ])
@@ -149,6 +159,7 @@ mod tests {
         assert_eq!(cli.max, Some(Bounds::new(2560, 1440).unwrap()));
         assert_eq!(cli.exclude, [PathBuf::from("cache/thumbnails")]);
         assert_eq!(cli.jobs.unwrap().get(), 4);
+        assert_eq!(cli.max_pixels.unwrap().get(), 50_000_000);
         assert!(cli.dry_run);
         assert!(cli.json);
     }
