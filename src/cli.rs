@@ -12,34 +12,40 @@ use crate::{Error, Result, plan::Bounds};
 #[command(
     name = "image-reducer",
     version,
-    about = "Safely downscale images that exceed orientation-aware bounds"
+    about = "Safely downscale oversized images without changing sources by default",
+    long_about = "Safely downscale oversized images without changing sources by default.\n\nThe plain command recursively finds supported images, uses orientation-aware 1920x1080 bounds, and writes only verified, smaller results to a new sibling directory such as SOURCE-reduced. Files that are within bounds are left untouched and are not copied.\n\nSupported formats: JPEG, PNG, WebP, BMP, single-page TIFF, and single-frame GIF.",
+    after_help = "COMMON WORKFLOWS:\n  Preview only (never writes):\n    image-reducer PHOTOS --dry-run\n\n  Preserve sources (default):\n    image-reducer PHOTOS\n    Writes reductions to a new sibling such as PHOTOS-reduced.\n\n  Use custom bounds and output directory:\n    image-reducer PHOTOS --max 2560x1440 --output /path/to/NEW_OUTPUT\n\n  Replace sources (irreversible; asks for confirmation):\n    image-reducer PHOTOS --replace\n\nSAFETY:\n  Start with --dry-run. The default mode never changes source files.\n  --replace permanently discards each higher-resolution source only after its\n  reduction is verified and durably published. Use --yes only for automation."
 )]
 pub struct Cli {
-    /// Directory containing source images
+    /// Directory to search recursively for supported images
     #[arg(value_hint = ValueHint::DirPath)]
     pub source: PathBuf,
 
-    /// Landscape-oriented maximum dimensions, such as 1920x1080
+    /// Landscape bounds; portrait uses rotated bounds [default: 1920x1080]
     #[arg(long, value_name = "WIDTHxHEIGHT")]
     pub max: Option<Bounds>,
 
-    /// Write reduced images beneath this new directory
+    /// New output directory outside SOURCE; must not already exist
     #[arg(long, value_hint = ValueHint::DirPath, conflicts_with = "replace")]
     pub output: Option<PathBuf>,
 
-    /// Transactionally replace source images after verification
+    /// Irreversibly replace each source after its reduction is verified
     #[arg(long, conflicts_with = "output")]
     pub replace: bool,
 
-    /// Exclude an exact source-relative directory and its subtree
+    /// Exclude a source-relative directory and subtree; may be repeated
     #[arg(long, value_name = "RELATIVE_DIRECTORY", value_hint = ValueHint::DirPath)]
     pub exclude: Vec<PathBuf>,
 
-    /// Lossy encoding quality
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+    /// JPEG quality from 1 to 100 [default: 92; ignored by other formats]
+    #[arg(
+        long,
+        value_name = "1-100",
+        value_parser = clap::value_parser!(u8).range(1..=100)
+    )]
     pub quality: Option<u8>,
 
-    /// Retain supported location and other metadata
+    /// Require supported metadata retention; skip images that cannot retain it
     #[arg(long)]
     pub preserve_all_metadata: bool,
 
@@ -47,19 +53,19 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Approve replacement without an interactive prompt
+    /// Skip the --replace confirmation prompt; intended for automation
     #[arg(long, requires = "replace")]
     pub yes: bool,
 
-    /// Maximum number of concurrent image-processing workers
+    /// Worker limit [default: automatic from available CPUs]
     #[arg(long)]
     pub jobs: Option<NonZeroUsize>,
 
-    /// Maximum decoded pixels allowed per image
+    /// Override the automatic memory-based decoded-pixel safety limit
     #[arg(long, value_name = "PIXELS")]
     pub max_pixels: Option<NonZeroU64>,
 
-    /// Emit a structured JSON report
+    /// Emit the final machine-readable report as JSON on stdout
     #[arg(long)]
     pub json: bool,
 }
@@ -132,7 +138,7 @@ impl FromStr for Bounds {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::*;
 
@@ -189,5 +195,23 @@ mod tests {
     #[test]
     fn rejects_parent_directory_exclusion() {
         assert!(validate_exclusion(std::path::Path::new("../elsewhere")).is_err());
+    }
+
+    #[test]
+    fn help_explains_defaults_safety_and_common_workflows() {
+        let help = Cli::command().render_long_help().to_string();
+
+        for expected in [
+            "without changing sources by default",
+            "orientation-aware 1920x1080 bounds",
+            "Supported formats: JPEG, PNG, WebP, BMP, single-page TIFF, and single-frame GIF",
+            "image-reducer PHOTOS --dry-run",
+            "image-reducer PHOTOS --replace",
+            "--replace permanently discards each higher-resolution source",
+            "default: 92; ignored by other formats",
+            "must not already exist",
+        ] {
+            assert!(help.contains(expected), "help is missing: {expected}");
+        }
     }
 }
