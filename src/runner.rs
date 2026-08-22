@@ -174,34 +174,37 @@ pub fn execute(
                     ProcessingOutcome::Reduced(candidate) => {
                         if cancelled.load(Ordering::Acquire) {
                             EntryOutcome::Interrupted
+                        } else if !details
+                            .source_fingerprint
+                            .matches_path(&source)
+                            .unwrap_or(false)
+                        {
+                            EntryOutcome::Failed {
+                                error: "source changed while its reduction was being built"
+                                    .to_owned(),
+                            }
                         } else {
-                            if !details
-                                .source_fingerprint
-                                .matches_path(&source)
-                                .unwrap_or(false)
-                            {
-                                EntryOutcome::Failed {
-                                    error: "source changed while its reduction was being built"
-                                        .to_owned(),
-                                }
-                            } else {
-                                match publish(
-                                    plan,
-                                    &roots,
-                                    relative_path,
-                                    details.source_fingerprint,
-                                    &candidate.bytes,
-                                ) {
-                                    Ok(()) => EntryOutcome::Reduced {
+                            match publish(
+                                plan,
+                                &roots,
+                                relative_path,
+                                details.source_fingerprint,
+                                &candidate.bytes,
+                            ) {
+                                Ok(publication_warnings) => {
+                                    let bytes_saved = candidate.bytes_saved();
+                                    let mut warnings = candidate.warnings;
+                                    warnings.extend(publication_warnings);
+                                    EntryOutcome::Reduced {
                                         source_bytes: candidate.source_bytes,
                                         output_bytes: candidate.bytes.len() as u64,
-                                        bytes_saved: candidate.bytes_saved(),
-                                        warnings: candidate.warnings,
-                                    },
-                                    Err(error) => EntryOutcome::Failed {
-                                        error: error.to_string(),
-                                    },
+                                        bytes_saved,
+                                        warnings,
+                                    }
                                 }
+                                Err(error) => EntryOutcome::Failed {
+                                    error: error.to_string(),
+                                },
                             }
                         }
                     }
@@ -265,7 +268,7 @@ fn publish(
     relative_path: &Path,
     fingerprint: SourceFingerprint,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let (source_parent, file_name) = open_relative_parent(&roots.source, relative_path, false)?;
     let source_file = openat(
         &source_parent,
@@ -305,7 +308,7 @@ fn publish(
             .map_err(|source| Error::Io {
                 path: output.join(relative_path),
                 source,
-            })?;
+            })
         }
         Mode::Replace => publish_file(
             &source_parent,
@@ -331,9 +334,8 @@ fn publish(
         .map_err(|source| Error::Io {
             path: plan.source.join(relative_path),
             source,
-        })?,
+        }),
     }
-    Ok(())
 }
 
 fn publish_file(
@@ -344,12 +346,9 @@ fn publish_file(
     replace: bool,
     expected_source: Option<SourceFingerprint>,
     source_unchanged: impl FnOnce() -> bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<String>> {
     let mut temporary = TemporaryFile::new(parent)?;
     temporary.file.write_all(bytes)?;
-    temporary
-        .file
-        .set_permissions(Permissions::from_mode(source_metadata.permissions().mode()))?;
     filetime::set_file_handle_times(
         &temporary.file,
         None,
@@ -366,6 +365,9 @@ fn publish_file(
     {
         return Err(error.into());
     }
+    temporary
+        .file
+        .set_permissions(Permissions::from_mode(source_metadata.permissions().mode()))?;
     temporary.file.sync_all()?;
     if !source_unchanged() {
         return Err(std::io::Error::other(
@@ -404,7 +406,36 @@ fn publish_file(
                 "source changed during atomic publication",
             ));
         }
-        unlinkat(parent, temporary.name.as_str(), AtFlags::empty())?;
+        if let Err(sync_error) = fsync(parent) {
+            let rollback = renameat_with(
+                parent,
+                temporary.name.as_str(),
+                parent,
+                destination,
+                RenameFlags::EXCHANGE,
+            );
+            let rollback_sync = fsync(parent);
+            return match (rollback, rollback_sync) {
+                (Ok(()), Ok(())) => Err(sync_error.into()),
+                (rollback, rollback_sync) => Err(std::io::Error::other(format!(
+                    "replacement durability failed ({sync_error}); rollback result: {rollback:?}; rollback sync result: {rollback_sync:?}"
+                ))),
+            };
+        }
+        if let Err(error) = unlinkat(parent, temporary.name.as_str(), AtFlags::empty()) {
+            temporary.published = true;
+            return Ok(vec![format!(
+                "replacement is durable, but the displaced source remains as {} because cleanup failed: {error}",
+                temporary.name
+            )]);
+        }
+        temporary.published = true;
+        if let Err(error) = fsync(parent) {
+            return Ok(vec![format!(
+                "replacement is durable, but temporary-file cleanup could not be synchronized: {error}"
+            )]);
+        }
+        Ok(Vec::new())
     } else {
         renameat_with(
             parent,
@@ -413,10 +444,10 @@ fn publish_file(
             destination,
             RenameFlags::NOREPLACE,
         )?;
+        temporary.published = true;
+        fsync(parent)?;
+        Ok(Vec::new())
     }
-    temporary.published = true;
-    fsync(parent)?;
-    Ok(())
 }
 
 fn open_relative_parent<'a>(
@@ -682,6 +713,66 @@ mod tests {
             std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
             0o640
         );
+        assert_eq!(std::fs::read_dir(&plan.source).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replacement_restores_special_permission_bits_after_ownership() {
+        let (_parent, plan, _inspected) = plan_and_inspection(true);
+        let source = plan.source.join("photo.png");
+        std::fs::set_permissions(&source, Permissions::from_mode(0o6750)).unwrap();
+        let inspected = inspect_files(
+            &plan.source,
+            &[PathBuf::from("photo.png")],
+            plan.bounds,
+            DEFAULT_MAX_PIXELS,
+        );
+
+        let results = execute(
+            &plan,
+            &inspected,
+            RunOptions {
+                jobs: Some(1),
+                processing: ProcessingOptions::default(),
+                show_progress: false,
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert!(matches!(results[0].outcome, EntryOutcome::Reduced { .. }));
+        assert_eq!(
+            std::fs::metadata(source).unwrap().permissions().mode() & 0o7777,
+            0o6750
+        );
+    }
+
+    #[test]
+    fn rolls_back_when_source_changes_at_atomic_exchange() {
+        let (_parent, plan, inspected) = plan_and_inspection(true);
+        let source = plan.source.join("photo.png");
+        let Classification::Eligible(details) = &inspected[0].classification else {
+            panic!("expected eligible image")
+        };
+        let parent = open_directory(&plan.source).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+
+        let result = publish_file(
+            &parent,
+            std::ffi::OsStr::new("photo.png"),
+            b"candidate",
+            &metadata,
+            true,
+            Some(details.source_fingerprint),
+            || {
+                std::fs::remove_file(&source).unwrap();
+                std::fs::write(&source, b"new source").unwrap();
+                true
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"new source");
         assert_eq!(std::fs::read_dir(&plan.source).unwrap().count(), 1);
     }
 

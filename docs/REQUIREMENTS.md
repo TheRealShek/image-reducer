@@ -172,7 +172,7 @@ Use Rust 2024 with a minimum supported Rust version of 1.89. Keep the applicatio
 | ICC color | `moxcms` pure-Rust color transforms |
 | Metadata | `image` metadata APIs, `img-parts` container handling, and isolated `kamadak-exif` parsing/reconstruction |
 | Concurrency | One dedicated Rayon pool plus a weighted memory budget |
-| Durable writes | Destination-local `tempfile` output with `rustix` synchronization and atomic publication |
+| Durable writes | Destination-local exclusive `openat` temporary output with `rustix` synchronization and atomic publication |
 | File attributes | Standard Unix APIs, `filetime`, and `rustix` where needed |
 | Cancellation | `ctrlc` with an atomic cancellation flag |
 | Reports | `serde`, `serde_json`, and terminal-only `indicatif` progress |
