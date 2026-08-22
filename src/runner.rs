@@ -2,23 +2,28 @@ use std::{
     fs::{File, Permissions},
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use filetime::FileTime;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rustix::{
-    fs::fchown,
+    fs::{
+        AtFlags, Mode as FileMode, OFlags, RenameFlags, fchown, fsync, mkdirat, open, openat,
+        renameat_with, unlinkat,
+    },
+    io::{Errno, dup},
     process::{Gid, Uid},
 };
 
 use crate::{
     Error, Result,
-    inspection::{Classification, InspectedEntry},
+    inspection::{Classification, InspectedEntry, SourceFingerprint},
     plan::{Mode, Plan},
     processing::{ProcessingOptions, ProcessingOutcome, process_image},
 };
@@ -26,6 +31,7 @@ use crate::{
 const MAX_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 const MIN_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 const ESTIMATED_BYTES_PER_PIXEL: u64 = 32;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub enum EntryOutcome {
@@ -33,6 +39,7 @@ pub enum EntryOutcome {
         source_bytes: u64,
         output_bytes: u64,
         bytes_saved: u64,
+        warnings: Vec<String>,
     },
     NotBeneficial {
         source_bytes: u64,
@@ -124,6 +131,7 @@ pub fn execute(
             source,
         })?;
     }
+    let roots = PublishRoots::open(plan)?;
 
     let jobs = options
         .jobs
@@ -137,9 +145,16 @@ pub fn execute(
         .unwrap_or(512 * 1024 * 1024)
         .clamp(MIN_MEMORY_BUDGET, MAX_MEMORY_BUDGET);
     let memory = MemoryBudget::new(memory_limit);
-    let completed = AtomicUsize::new(0);
-    let progress_lock = Mutex::new(());
-
+    let progress = if options.show_progress {
+        let progress = ProgressBar::new(eligible.len() as u64);
+        progress.set_style(
+            ProgressStyle::with_template("[{pos}/{len}] {wide_msg} {bar:30}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        progress
+    } else {
+        ProgressBar::hidden()
+    };
     let mut results = pool.install(|| {
         eligible
             .par_iter()
@@ -170,11 +185,18 @@ pub fn execute(
                                         .to_owned(),
                                 }
                             } else {
-                                match publish(plan, relative_path, &source, &candidate.bytes) {
+                                match publish(
+                                    plan,
+                                    &roots,
+                                    relative_path,
+                                    details.source_fingerprint,
+                                    &candidate.bytes,
+                                ) {
                                     Ok(()) => EntryOutcome::Reduced {
                                         source_bytes: candidate.source_bytes,
                                         output_bytes: candidate.bytes.len() as u64,
                                         bytes_saved: candidate.bytes_saved(),
+                                        warnings: candidate.warnings,
                                     },
                                     Err(error) => EntryOutcome::Failed {
                                         error: error.to_string(),
@@ -194,18 +216,8 @@ pub fn execute(
                     }
                     ProcessingOutcome::Failed { error } => EntryOutcome::Failed { error },
                 };
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if options.show_progress {
-                    let _guard = progress_lock
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    eprintln!(
-                        "[{done}/{}] {}: {}",
-                        eligible.len(),
-                        relative_path.display(),
-                        outcome.kind()
-                    );
-                }
+                progress.set_message(format!("{}: {}", relative_path.display(), outcome.kind()));
+                progress.inc(1);
                 ProcessedEntry {
                     relative_path: relative_path.clone(),
                     outcome,
@@ -213,101 +225,288 @@ pub fn execute(
             })
             .collect::<Vec<_>>()
     });
+    progress.finish_and_clear();
     results.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(results)
 }
 
-fn publish(plan: &Plan, relative_path: &Path, source: &Path, bytes: &[u8]) -> Result<()> {
+struct PublishRoots {
+    source: File,
+    output: Option<File>,
+}
+
+impl PublishRoots {
+    fn open(plan: &Plan) -> Result<Self> {
+        let source = open_directory(&plan.source)?;
+        let output = match &plan.mode {
+            Mode::Preserve { output, .. } => Some(open_directory(output)?),
+            Mode::Replace => None,
+        };
+        Ok(Self { source, output })
+    }
+}
+
+fn open_directory(path: &Path) -> Result<File> {
+    open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        FileMode::empty(),
+    )
+    .map(File::from)
+    .map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })
+}
+
+fn publish(
+    plan: &Plan,
+    roots: &PublishRoots,
+    relative_path: &Path,
+    fingerprint: SourceFingerprint,
+    bytes: &[u8],
+) -> Result<()> {
+    let (source_parent, file_name) = open_relative_parent(&roots.source, relative_path, false)?;
+    let source_file = openat(
+        &source_parent,
+        file_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        FileMode::empty(),
+    )
+    .map(File::from)
+    .map_err(|source| Error::Io {
+        path: plan.source.join(relative_path),
+        source: source.into(),
+    })?;
+    let source_metadata = source_file.metadata().map_err(|source| Error::Io {
+        path: plan.source.join(relative_path),
+        source,
+    })?;
+    if !fingerprint.matches_metadata(&source_metadata) {
+        return Err(Error::InvalidArgument(
+            "source changed while its reduction was being built".to_owned(),
+        ));
+    }
+
     match &plan.mode {
         Mode::Preserve { output, .. } => {
-            let destination = output.join(relative_path);
-            let parent = destination.parent().ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "output path has no parent: {}",
-                    destination.display()
-                ))
-            })?;
-            std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-                path: parent.to_path_buf(),
+            let root = roots.output.as_ref().expect("preservation output is open");
+            let (destination_parent, destination_name) =
+                open_relative_parent(root, relative_path, true)?;
+            publish_file(
+                &destination_parent,
+                destination_name,
+                bytes,
+                &source_metadata,
+                false,
+                None,
+                || true,
+            )
+            .map_err(|source| Error::Io {
+                path: output.join(relative_path),
                 source,
             })?;
-            publish_file(source, &destination, bytes, false)?;
         }
-        Mode::Replace => publish_file(source, source, bytes, true)?,
+        Mode::Replace => publish_file(
+            &source_parent,
+            file_name,
+            bytes,
+            &source_metadata,
+            true,
+            Some(fingerprint),
+            || {
+                let Ok(file) = openat(
+                    &source_parent,
+                    file_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    FileMode::empty(),
+                ) else {
+                    return false;
+                };
+                File::from(file)
+                    .metadata()
+                    .is_ok_and(|metadata| fingerprint.matches_metadata(&metadata))
+            },
+        )
+        .map_err(|source| Error::Io {
+            path: plan.source.join(relative_path),
+            source,
+        })?,
     }
     Ok(())
 }
 
-fn publish_file(source: &Path, destination: &Path, bytes: &[u8], replace: bool) -> Result<()> {
-    let parent = destination.parent().ok_or_else(|| {
-        Error::InvalidArgument(format!(
-            "destination has no parent: {}",
-            destination.display()
-        ))
-    })?;
-    let source_metadata = std::fs::metadata(source).map_err(|error| Error::Io {
-        path: source.to_path_buf(),
-        source: error,
-    })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|source| Error::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    temporary.write_all(bytes).map_err(|source| Error::Io {
-        path: temporary.path().to_path_buf(),
-        source,
-    })?;
+fn publish_file(
+    parent: &File,
+    destination: &std::ffi::OsStr,
+    bytes: &[u8],
+    source_metadata: &std::fs::Metadata,
+    replace: bool,
+    expected_source: Option<SourceFingerprint>,
+    source_unchanged: impl FnOnce() -> bool,
+) -> std::io::Result<()> {
+    let mut temporary = TemporaryFile::new(parent)?;
+    temporary.file.write_all(bytes)?;
     temporary
-        .as_file()
-        .set_permissions(Permissions::from_mode(source_metadata.permissions().mode()))
-        .map_err(|source| Error::Io {
-            path: temporary.path().to_path_buf(),
-            source,
-        })?;
-    filetime::set_file_mtime(
-        temporary.path(),
-        FileTime::from_last_modification_time(&source_metadata),
-    )
-    .map_err(|source| Error::Io {
-        path: temporary.path().to_path_buf(),
-        source,
-    })?;
+        .file
+        .set_permissions(Permissions::from_mode(source_metadata.permissions().mode()))?;
+    filetime::set_file_handle_times(
+        &temporary.file,
+        None,
+        Some(FileTime::from_last_modification_time(source_metadata)),
+    )?;
 
     if replace
         && let Err(error) = fchown(
-            temporary.as_file(),
+            &temporary.file,
             Some(Uid::from_raw(source_metadata.uid())),
             Some(Gid::from_raw(source_metadata.gid())),
         )
         && error != rustix::io::Errno::PERM
     {
-        return Err(Error::Io {
-            path: temporary.path().to_path_buf(),
-            source: error.into(),
-        });
+        return Err(error.into());
     }
-    temporary.as_file().sync_all().map_err(|source| Error::Io {
-        path: temporary.path().to_path_buf(),
-        source,
-    })?;
+    temporary.file.sync_all()?;
+    if !source_unchanged() {
+        return Err(std::io::Error::other(
+            "source changed immediately before publication",
+        ));
+    }
     if replace {
-        temporary.persist(destination).map_err(|error| Error::Io {
-            path: destination.to_path_buf(),
-            source: error.error,
-        })?;
+        renameat_with(
+            parent,
+            temporary.name.as_str(),
+            parent,
+            destination,
+            RenameFlags::EXCHANGE,
+        )?;
+        let displaced_matches = match openat(
+            parent,
+            temporary.name.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            FileMode::empty(),
+        ) {
+            Ok(file) => File::from(file).metadata().is_ok_and(|metadata| {
+                expected_source.is_some_and(|fingerprint| fingerprint.matches_metadata(&metadata))
+            }),
+            Err(_) => false,
+        };
+        if !displaced_matches {
+            renameat_with(
+                parent,
+                temporary.name.as_str(),
+                parent,
+                destination,
+                RenameFlags::EXCHANGE,
+            )?;
+            fsync(parent)?;
+            return Err(std::io::Error::other(
+                "source changed during atomic publication",
+            ));
+        }
+        unlinkat(parent, temporary.name.as_str(), AtFlags::empty())?;
     } else {
-        temporary
-            .persist_noclobber(destination)
-            .map_err(|error| Error::Io {
-                path: destination.to_path_buf(),
-                source: error.error,
-            })?;
+        renameat_with(
+            parent,
+            temporary.name.as_str(),
+            parent,
+            destination,
+            RenameFlags::NOREPLACE,
+        )?;
     }
-    sync_directory(parent).map_err(|source| Error::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
+    temporary.published = true;
+    fsync(parent)?;
     Ok(())
+}
+
+fn open_relative_parent<'a>(
+    root: &File,
+    relative_path: &'a Path,
+    create: bool,
+) -> Result<(File, &'a std::ffi::OsStr)> {
+    let file_name = relative_path.file_name().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "path has no file name: {}",
+            relative_path.display()
+        ))
+    })?;
+    let mut current = File::from(dup(root).map_err(|source| Error::Io {
+        path: relative_path.to_path_buf(),
+        source: source.into(),
+    })?);
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        let Component::Normal(name) = component else {
+            return Err(Error::InvalidArgument(format!(
+                "unsafe relative path: {}",
+                relative_path.display()
+            )));
+        };
+        if create {
+            match mkdirat(&current, name, FileMode::from_raw_mode(0o755)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: relative_path.to_path_buf(),
+                        source: source.into(),
+                    });
+                }
+            }
+        }
+        current = openat(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            FileMode::empty(),
+        )
+        .map(File::from)
+        .map_err(|source| Error::Io {
+            path: relative_path.to_path_buf(),
+            source: source.into(),
+        })?;
+    }
+    Ok((current, file_name))
+}
+
+struct TemporaryFile<'a> {
+    parent: &'a File,
+    name: String,
+    file: File,
+    published: bool,
+}
+
+impl<'a> TemporaryFile<'a> {
+    fn new(parent: &'a File) -> std::io::Result<Self> {
+        loop {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let name = format!(".image-reducer-{}-{sequence}.tmp", std::process::id());
+            match openat(
+                parent,
+                name.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                FileMode::from_raw_mode(0o600),
+            ) {
+                Ok(file) => {
+                    return Ok(Self {
+                        parent,
+                        name,
+                        file: File::from(file),
+                        published: false,
+                    });
+                }
+                Err(Errno::EXIST) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for TemporaryFile<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = unlinkat(self.parent, self.name.as_str(), AtFlags::empty());
+        }
+    }
 }
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {
@@ -365,7 +564,10 @@ impl Drop for MemoryPermit<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicBool};
+    use std::{
+        os::unix::fs::{PermissionsExt, symlink},
+        sync::atomic::AtomicBool,
+    };
 
     use image::{GenericImageView, ImageFormat, Rgb, RgbImage};
 
@@ -533,5 +735,21 @@ mod tests {
             unreachable!()
         };
         assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn refuses_to_follow_symlinked_output_subdirectory() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("output");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, output.join("nested")).unwrap();
+        let root = open_directory(&output).unwrap();
+
+        let result = open_relative_parent(&root, Path::new("nested/photo.png"), true);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
     }
 }

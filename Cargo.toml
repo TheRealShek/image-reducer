@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Safely downscale images that exceed orientation-aware bounds"
+publish = false
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -12,6 +13,8 @@ fast_image_resize = { version = "6.1.0", features = ["image"] }
 filetime = "0.2.29"
 gif = "0.14.2"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+indicatif = "0.18.3"
+img-parts = "0.4.0"
 kamadak-exif = "0.6.1"
 moxcms = "0.8.1"
 rayon = "1.12.0"

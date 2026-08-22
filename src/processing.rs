@@ -10,6 +10,7 @@ use image::{
     DynamicImage, ExtendedColorType, GenericImageView, ImageBuffer, ImageDecoder, ImageEncoder,
     ImageFormat, ImageReader, metadata::Orientation,
 };
+use img_parts::{DynImage, ImageEXIF, ImageICC};
 use moxcms::{ColorProfile, Layout, TransformOptions};
 
 use crate::inspection::{Dimensions, ImageDetails, SupportedFormat};
@@ -38,6 +39,7 @@ pub struct Candidate {
     pub format: SupportedFormat,
     pub dimensions: Dimensions,
     pub source_bytes: u64,
+    pub warnings: Vec<String>,
 }
 
 impl Candidate {
@@ -58,6 +60,7 @@ pub enum ProcessingOutcome {
 struct Metadata {
     icc: Option<Vec<u8>>,
     exif: Option<Vec<u8>>,
+    warnings: Vec<String>,
 }
 
 pub fn process_image(
@@ -159,19 +162,14 @@ fn process_image_inner(
     }
 
     let bytes = encode(&resized, details.format, &metadata, options.jpeg_quality)?;
-    verify(
-        &bytes,
-        details,
-        resized.color().has_alpha(),
-        source_has_alpha,
-        &metadata,
-    )?;
+    verify(&bytes, details, &resized, source_has_alpha, &metadata)?;
 
     Ok(Candidate {
         bytes,
         format: details.format,
         dimensions: details.output_dimensions,
         source_bytes: details.source_bytes,
+        warnings: metadata.warnings,
     })
 }
 
@@ -242,17 +240,18 @@ fn read_metadata(
     check_metadata_size("ICC profile", icc.as_deref())?;
     let raw_exif = decoder.exif_metadata().map_err(ProcessError::failure)?;
     check_metadata_size("EXIF metadata", raw_exif.as_deref())?;
+    let had_exif = raw_exif.is_some();
+    let xmp = decoder.xmp_metadata().map_err(ProcessError::failure)?;
+    check_metadata_size("XMP metadata", xmp.as_deref())?;
+    let iptc = decoder.iptc_metadata().map_err(ProcessError::failure)?;
+    check_metadata_size("IPTC metadata", iptc.as_deref())?;
 
     if options.preserve_all_metadata {
-        let xmp = decoder.xmp_metadata().map_err(ProcessError::failure)?;
-        check_metadata_size("XMP metadata", xmp.as_deref())?;
         if xmp.is_some() {
             return Err(ProcessError::fidelity(
                 "preserve-all mode cannot safely re-encode XMP metadata for this image",
             ));
         }
-        let iptc = decoder.iptc_metadata().map_err(ProcessError::failure)?;
-        check_metadata_size("IPTC metadata", iptc.as_deref())?;
         if iptc.is_some() {
             return Err(ProcessError::fidelity(
                 "preserve-all mode cannot safely re-encode IPTC metadata for this image",
@@ -274,6 +273,28 @@ fn read_metadata(
         None => None,
     };
 
+    let mut warnings = Vec::new();
+    if !options.preserve_all_metadata {
+        if had_exif {
+            warnings.push(
+                "EXIF metadata was reduced to capture date; GPS and other fields were removed. Use --preserve-all-metadata to require retention."
+                    .to_owned(),
+            );
+        }
+        if xmp.is_some() {
+            warnings.push(
+                "XMP metadata was removed. Use --preserve-all-metadata to require retention."
+                    .to_owned(),
+            );
+        }
+        if iptc.is_some() {
+            warnings.push(
+                "IPTC metadata was removed. Use --preserve-all-metadata to require retention."
+                    .to_owned(),
+            );
+        }
+    }
+
     if exif.is_some()
         && !matches!(
             format,
@@ -290,7 +311,11 @@ fn read_metadata(
         )));
     }
 
-    Ok(Metadata { icc, exif })
+    Ok(Metadata {
+        icc,
+        exif,
+        warnings,
+    })
 }
 
 fn check_metadata_size(name: &str, metadata: Option<&[u8]>) -> Result<(), ProcessError> {
@@ -515,10 +540,11 @@ fn set_metadata(encoder: &mut impl ImageEncoder, metadata: &Metadata) -> Result<
 fn verify(
     bytes: &[u8],
     details: &ImageDetails,
-    resized_has_alpha: bool,
+    resized: &DynamicImage,
     source_has_alpha: bool,
     expected_metadata: &Metadata,
 ) -> Result<(), ProcessError> {
+    verify_container_metadata(bytes, details.format, expected_metadata)?;
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(ProcessError::failure)?;
@@ -543,7 +569,7 @@ fn verify(
             "candidate still requests a visual orientation transform",
         ));
     }
-    if source_has_alpha && (!resized_has_alpha || !decoder.color_type().has_alpha()) {
+    if source_has_alpha && (!resized.color().has_alpha() || !decoder.color_type().has_alpha()) {
         return Err(ProcessError::fidelity(
             "candidate did not retain the source alpha channel",
         ));
@@ -559,12 +585,61 @@ fn verify(
         ));
     }
 
-    let mut decoded =
-        vec![0; usize::try_from(decoder.total_bytes()).map_err(ProcessError::failure)?];
-    decoder
-        .read_image(&mut decoded)
-        .map_err(ProcessError::failure)?;
+    let candidate = DynamicImage::from_decoder(decoder).map_err(ProcessError::failure)?;
+    if !matches!(details.format, SupportedFormat::Jpeg | SupportedFormat::Gif)
+        && (candidate.color() != resized.color() || candidate.as_bytes() != resized.as_bytes())
+    {
+        return Err(ProcessError::fidelity(
+            "candidate pixel colors or transparency differ after round-trip verification",
+        ));
+    }
+    if source_has_alpha && alpha_samples(&candidate) != alpha_samples(resized) {
+        return Err(ProcessError::fidelity(
+            "candidate transparency values differ after round-trip verification",
+        ));
+    }
     Ok(())
+}
+
+fn verify_container_metadata(
+    bytes: &[u8],
+    format: SupportedFormat,
+    expected: &Metadata,
+) -> Result<(), ProcessError> {
+    if !matches!(
+        format,
+        SupportedFormat::Jpeg | SupportedFormat::Png | SupportedFormat::WebP
+    ) {
+        return Ok(());
+    }
+    let container = DynImage::from_bytes(bytes.to_vec().into())
+        .map_err(ProcessError::failure)?
+        .ok_or_else(|| ProcessError::failure("candidate container could not be identified"))?;
+    if container.icc_profile().as_deref() != expected.icc.as_deref() {
+        return Err(ProcessError::failure(
+            "container ICC profile differs from the required profile",
+        ));
+    }
+    if container.exif().as_deref() != expected.exif.as_deref() {
+        return Err(ProcessError::failure(
+            "container EXIF metadata differs from the required metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn alpha_samples(image: &DynamicImage) -> Option<Vec<u16>> {
+    match image {
+        DynamicImage::ImageLumaA8(buffer) => {
+            Some(buffer.pixels().map(|pixel| u16::from(pixel[1])).collect())
+        }
+        DynamicImage::ImageRgba8(buffer) => {
+            Some(buffer.pixels().map(|pixel| u16::from(pixel[3])).collect())
+        }
+        DynamicImage::ImageLumaA16(buffer) => Some(buffer.pixels().map(|pixel| pixel[1]).collect()),
+        DynamicImage::ImageRgba16(buffer) => Some(buffer.pixels().map(|pixel| pixel[3]).collect()),
+        _ => None,
+    }
 }
 
 fn image_format(format: SupportedFormat) -> ImageFormat {
@@ -681,6 +756,9 @@ mod tests {
                 .is_some()
         );
         assert!(parsed.get_field(Tag::GPSLatitudeRef, In::PRIMARY).is_none());
+        assert!(candidate.warnings.iter().any(|warning| {
+            warning.contains("GPS") && warning.contains("--preserve-all-metadata")
+        }));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use clap::Parser;
 use image_reducer::{
     cli::Cli,
     discovery::{Discovery, discover},
-    inspection::{Classification, Dimensions, InspectedEntry, inspect_files},
+    inspection::{Classification, ClassificationKind, Dimensions, InspectedEntry, inspect_files},
     plan::{Mode, Plan},
     processing::{DEFAULT_JPEG_QUALITY, ProcessingOptions},
     runner::{
@@ -36,10 +36,14 @@ fn run() -> image_reducer::Result<bool> {
         .max_pixels
         .map_or_else(default_max_pixels, std::num::NonZeroU64::get);
     let inspected = inspect_files(&plan.source, &discovery.files, plan.bounds, max_pixels);
-    let eligible = count_classification(&inspected, "eligible");
+    let eligible = count_classification(&inspected, ClassificationKind::Eligible);
+
+    if !cli.dry_run && eligible > 0 {
+        print_pre_run_plan(&plan, eligible);
+    }
 
     if !cli.dry_run && matches!(plan.mode, Mode::Replace) && eligible > 0 && !cli.yes {
-        confirm_replacement(&plan, eligible)?;
+        confirm_replacement()?;
     }
     if cli
         .quality
@@ -79,13 +83,7 @@ fn run() -> image_reducer::Result<bool> {
     Ok(has_failures(&discovery, &inspected, &processed))
 }
 
-fn confirm_replacement(plan: &Plan, eligible: usize) -> image_reducer::Result<()> {
-    eprintln!("Source: {}", plan.source.display());
-    eprintln!("Target bounds: {} (orientation-aware)", plan.bounds);
-    eprintln!("Eligible images: {eligible}");
-    eprintln!(
-        "Replacement permanently removes the higher-resolution source after each verified reduction."
-    );
+fn confirm_replacement() -> image_reducer::Result<()> {
     eprint!("Continue? [y/N] ");
     io::stderr()
         .flush()
@@ -106,6 +104,20 @@ fn confirm_replacement(plan: &Plan, eligible: usize) -> image_reducer::Result<()
         ));
     }
     Ok(())
+}
+
+fn print_pre_run_plan(plan: &Plan, eligible: usize) {
+    eprintln!("Plan: {}", plan.source.display());
+    eprintln!("Target bounds: {} (orientation-aware)", plan.bounds);
+    eprintln!("Eligible images: {eligible}");
+    match &plan.mode {
+        Mode::Preserve { output, .. } => {
+            eprintln!("Output: {} (sources remain unchanged)", output.display());
+        }
+        Mode::Replace => eprintln!(
+            "Policy: each verified reduction permanently replaces its higher-resolution source."
+        ),
+    }
 }
 
 fn print_human_report(
@@ -180,10 +192,16 @@ fn print_human_report(
                 source_bytes,
                 output_bytes,
                 bytes_saved,
-            } => println!(
-                "Reduced {}: {source_bytes} -> {output_bytes} bytes ({bytes_saved} saved)",
-                entry.relative_path.display()
-            ),
+                warnings,
+            } => {
+                println!(
+                    "Reduced {}: {source_bytes} -> {output_bytes} bytes ({bytes_saved} saved)",
+                    entry.relative_path.display()
+                );
+                for warning in warnings {
+                    println!("Warning for {}: {warning}", entry.relative_path.display());
+                }
+            }
             EntryOutcome::NotBeneficial {
                 source_bytes,
                 candidate_bytes,
@@ -283,7 +301,7 @@ fn inspection_json(entry: &InspectedEntry) -> serde_json::Value {
     match &entry.classification {
         Classification::Eligible(details) | Classification::WithinBounds(details) => json!({
             "path": entry.relative_path,
-            "classification": entry.classification.kind(),
+            "classification": entry.classification.kind().as_str(),
             "format": details.format.as_str(),
             "encoded_dimensions": dimensions_json(details.encoded_dimensions),
             "displayed_dimensions": dimensions_json(details.displayed_dimensions),
@@ -312,12 +330,14 @@ fn processed_json(entry: &ProcessedEntry) -> serde_json::Value {
             source_bytes,
             output_bytes,
             bytes_saved,
+            warnings,
         } => json!({
             "path": entry.relative_path,
             "outcome": "reduced",
             "source_bytes": source_bytes,
             "output_bytes": output_bytes,
             "bytes_saved": bytes_saved,
+            "warnings": warnings,
         }),
         EntryOutcome::NotBeneficial {
             source_bytes,
@@ -349,7 +369,7 @@ fn dimensions_json(dimensions: Dimensions) -> serde_json::Value {
     json!({ "width": dimensions.width, "height": dimensions.height })
 }
 
-fn count_classification(inspected: &[InspectedEntry], kind: &str) -> usize {
+fn count_classification(inspected: &[InspectedEntry], kind: ClassificationKind) -> usize {
     inspected
         .iter()
         .filter(|entry| entry.classification.kind() == kind)
@@ -393,9 +413,11 @@ impl Summary {
         dry_run: bool,
     ) -> Self {
         let mut summary = Self {
-            within_bounds: count_classification(inspected, "within_bounds"),
-            skipped: discovery.skipped.len() + count_classification(inspected, "skipped"),
-            failed: discovery.failures.len() + count_classification(inspected, "failed"),
+            within_bounds: count_classification(inspected, ClassificationKind::WithinBounds),
+            skipped: discovery.skipped.len()
+                + count_classification(inspected, ClassificationKind::Skipped),
+            failed: discovery.failures.len()
+                + count_classification(inspected, ClassificationKind::Failed),
             ..Self::default()
         };
         if dry_run {
@@ -407,6 +429,7 @@ impl Summary {
                     source_bytes,
                     output_bytes,
                     bytes_saved,
+                    ..
                 } => {
                     summary.reduced += 1;
                     summary.source_bytes += source_bytes;

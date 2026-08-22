@@ -106,6 +106,10 @@ impl SourceFingerprint {
     pub fn matches_path(self, path: &Path) -> std::io::Result<bool> {
         std::fs::metadata(path).map(|metadata| self == Self::from_metadata(&metadata))
     }
+
+    pub(crate) fn matches_metadata(self, metadata: &std::fs::Metadata) -> bool {
+        self == Self::from_metadata(metadata)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -117,12 +121,31 @@ pub enum Classification {
 }
 
 impl Classification {
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> ClassificationKind {
         match self {
-            Self::Eligible(_) => "eligible",
-            Self::WithinBounds(_) => "within_bounds",
-            Self::Skipped { .. } => "skipped",
-            Self::Failed { .. } => "failed",
+            Self::Eligible(_) => ClassificationKind::Eligible,
+            Self::WithinBounds(_) => ClassificationKind::WithinBounds,
+            Self::Skipped { .. } => ClassificationKind::Skipped,
+            Self::Failed { .. } => ClassificationKind::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClassificationKind {
+    Eligible,
+    WithinBounds,
+    Skipped,
+    Failed,
+}
+
+impl ClassificationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::WithinBounds => "within_bounds",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
         }
     }
 }
