@@ -2,6 +2,7 @@ use std::{
     fmt,
     fs::File,
     io::BufReader,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -78,7 +79,33 @@ pub struct ImageDetails {
     pub orientation: u8,
     pub color_type: String,
     pub source_bytes: u64,
+    pub source_fingerprint: SourceFingerprint,
     pub extension_warning: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceFingerprint {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl SourceFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+
+    pub fn matches_path(self, path: &Path) -> std::io::Result<bool> {
+        std::fs::metadata(path).map(|metadata| self == Self::from_metadata(&metadata))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -179,6 +206,7 @@ fn inspect_file(
         orientation: orientation.to_exif(),
         color_type,
         source_bytes: metadata.len(),
+        source_fingerprint: SourceFingerprint::from_metadata(&metadata),
         extension_warning: extension_warning(path, format),
     };
 

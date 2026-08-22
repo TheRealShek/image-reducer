@@ -97,6 +97,15 @@ fn process_image_inner(
     details: &ImageDetails,
     options: ProcessingOptions,
 ) -> Result<Candidate, ProcessError> {
+    if !details
+        .source_fingerprint
+        .matches_path(path)
+        .map_err(ProcessError::failure)?
+    {
+        return Err(ProcessError::failure(
+            "source changed after image inspection",
+        ));
+    }
     let image_format = image_format(details.format);
     let file = File::open(path).map_err(ProcessError::failure)?;
     let reader = ImageReader::with_format(BufReader::new(file), image_format);

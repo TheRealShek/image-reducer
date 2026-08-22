@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod inspection;
 pub mod plan;
 pub mod processing;
+pub mod runner;
 
 use std::path::PathBuf;
 
