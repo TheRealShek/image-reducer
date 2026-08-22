@@ -382,6 +382,9 @@ fn publish_file(
             destination,
             RenameFlags::EXCHANGE,
         )?;
+        // The temporary name now owns the displaced source, so cleanup must
+        // preserve it unless an exchange back succeeds or we explicitly unlink it.
+        temporary.published = true;
         let displaced_matches = match openat(
             parent,
             temporary.name.as_str(),
@@ -394,13 +397,17 @@ fn publish_file(
             Err(_) => false,
         };
         if !displaced_matches {
-            renameat_with(
+            let rollback = renameat_with(
                 parent,
                 temporary.name.as_str(),
                 parent,
                 destination,
                 RenameFlags::EXCHANGE,
-            )?;
+            );
+            if rollback.is_ok() {
+                temporary.published = false;
+            }
+            rollback?;
             fsync(parent)?;
             return Err(std::io::Error::other(
                 "source changed during atomic publication",
@@ -414,6 +421,9 @@ fn publish_file(
                 destination,
                 RenameFlags::EXCHANGE,
             );
+            if rollback.is_ok() {
+                temporary.published = false;
+            }
             let rollback_sync = fsync(parent);
             return match (rollback, rollback_sync) {
                 (Ok(()), Ok(())) => Err(sync_error.into()),
@@ -774,6 +784,34 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"new source");
         assert_eq!(std::fs::read_dir(&plan.source).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn temporary_guard_preserves_displaced_source_when_rollback_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("photo.png");
+        std::fs::write(&source, b"original source").unwrap();
+        let parent = open_directory(directory.path()).unwrap();
+        let mut temporary = TemporaryFile::new(&parent).unwrap();
+        temporary.file.write_all(b"candidate").unwrap();
+        let recovery_name = temporary.name.clone();
+
+        renameat_with(
+            &parent,
+            temporary.name.as_str(),
+            &parent,
+            std::ffi::OsStr::new("photo.png"),
+            RenameFlags::EXCHANGE,
+        )
+        .unwrap();
+        temporary.published = true;
+        drop(temporary);
+
+        assert_eq!(std::fs::read(source).unwrap(), b"candidate");
+        assert_eq!(
+            std::fs::read(directory.path().join(recovery_name)).unwrap(),
+            b"original source"
+        );
     }
 
     #[test]
