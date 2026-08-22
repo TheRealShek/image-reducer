@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader, Cursor},
+    io::{self, BufReader, Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -110,14 +110,23 @@ fn process_image_inner(
         ));
     }
     let image_format = image_format(details.format);
-    let file = File::open(path).map_err(ProcessError::failure)?;
+    let mut file = File::open(path).map_err(ProcessError::failure)?;
+    let native_text = read_native_text_metadata(&mut file, details.format)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(ProcessError::failure)?;
     let reader = ImageReader::with_format(BufReader::new(file), image_format);
     let mut decoder = reader.into_decoder().map_err(ProcessError::failure)?;
     let source_color = decoder.original_color_type();
     ensure_supported_color(source_color, details.format)?;
     let source_has_alpha = decoder.color_type().has_alpha();
     let orientation = decoder.orientation().map_err(ProcessError::failure)?;
-    let metadata = read_metadata(&mut decoder, orientation, details.format, options)?;
+    let metadata = read_metadata(
+        &mut decoder,
+        orientation,
+        details.format,
+        native_text,
+        options,
+    )?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(ProcessError::failure)?;
     image.apply_orientation(orientation);
     if image.dimensions()
@@ -234,6 +243,7 @@ fn read_metadata(
     decoder: &mut impl ImageDecoder,
     orientation: Orientation,
     format: SupportedFormat,
+    native_text: Option<&'static str>,
     options: ProcessingOptions,
 ) -> Result<Metadata, ProcessError> {
     let icc = decoder.icc_profile().map_err(ProcessError::failure)?;
@@ -247,6 +257,11 @@ fn read_metadata(
     check_metadata_size("IPTC metadata", iptc.as_deref())?;
 
     if options.preserve_all_metadata {
+        if let Some(description) = native_text {
+            return Err(ProcessError::fidelity(format!(
+                "preserve-all mode cannot safely re-encode {description}"
+            )));
+        }
         if xmp.is_some() {
             return Err(ProcessError::fidelity(
                 "preserve-all mode cannot safely re-encode XMP metadata for this image",
@@ -275,6 +290,11 @@ fn read_metadata(
 
     let mut warnings = Vec::new();
     if !options.preserve_all_metadata {
+        if let Some(description) = native_text {
+            warnings.push(format!(
+                "{description} was removed. Use --preserve-all-metadata to require retention."
+            ));
+        }
         if had_exif {
             warnings.push(
                 "EXIF metadata was reduced to capture date; GPS and other fields were removed. Use --preserve-all-metadata to require retention."
@@ -316,6 +336,197 @@ fn read_metadata(
         exif,
         warnings,
     })
+}
+
+fn read_native_text_metadata(
+    file: &mut File,
+    format: SupportedFormat,
+) -> Result<Option<&'static str>, ProcessError> {
+    let mut reader = BufReader::new(file);
+    let found = match format {
+        SupportedFormat::Png => scan_png_text_chunks(&mut reader),
+        SupportedFormat::Jpeg => scan_jpeg_comments(&mut reader),
+        SupportedFormat::Gif => scan_gif_comments(&mut reader),
+        SupportedFormat::WebP | SupportedFormat::Bmp | SupportedFormat::Tiff => return Ok(None),
+    }
+    .map_err(|error| {
+        ProcessError::failure(format!("cannot inspect native text metadata: {error}"))
+    })?;
+
+    if let Some((description, bytes)) = found {
+        if bytes > MAX_METADATA_BYTES {
+            return Err(ProcessError::fidelity(format!(
+                "{description} exceeds the {} MiB metadata limit",
+                MAX_METADATA_BYTES / 1024 / 1024
+            )));
+        }
+        return Ok(Some(description));
+    }
+    Ok(None)
+}
+
+fn scan_png_text_chunks(
+    reader: &mut (impl Read + Seek),
+) -> io::Result<Option<(&'static str, usize)>> {
+    let mut signature = [0_u8; 8];
+    reader.read_exact(&mut signature)?;
+    if signature != *b"\x89PNG\r\n\x1a\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid PNG signature",
+        ));
+    }
+
+    let mut text_bytes = 0_usize;
+    loop {
+        let length = read_u32_be(reader)?;
+        let mut kind = [0_u8; 4];
+        reader.read_exact(&mut kind)?;
+        if matches!(&kind, b"tEXt" | b"zTXt" | b"iTXt") {
+            text_bytes = text_bytes.checked_add(length as usize).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "PNG text is too large")
+            })?;
+        }
+        reader.seek(SeekFrom::Current(i64::from(length) + 4))?;
+        if kind == *b"IEND" {
+            break;
+        }
+    }
+
+    Ok((text_bytes > 0).then_some(("PNG text metadata", text_bytes)))
+}
+
+fn scan_jpeg_comments(
+    reader: &mut (impl Read + Seek),
+) -> io::Result<Option<(&'static str, usize)>> {
+    let mut signature = [0_u8; 2];
+    reader.read_exact(&mut signature)?;
+    if signature != [0xff, 0xd8] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid JPEG signature",
+        ));
+    }
+
+    let mut comment_bytes = 0_usize;
+    let mut byte = [0_u8; 1];
+    while reader.read(&mut byte)? != 0 {
+        if byte[0] != 0xff {
+            continue;
+        }
+        loop {
+            if reader.read(&mut byte)? == 0 {
+                return Ok((comment_bytes > 0).then_some(("JPEG comment metadata", comment_bytes)));
+            }
+            if byte[0] != 0xff {
+                break;
+            }
+        }
+        let marker = byte[0];
+        if marker == 0x00 || marker == 0x01 || (0xd0..=0xd8).contains(&marker) {
+            continue;
+        }
+        if marker == 0xd9 {
+            break;
+        }
+
+        let length = usize::from(read_u16_be(reader)?);
+        let payload = length.checked_sub(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid JPEG segment length")
+        })?;
+        if marker == 0xfe {
+            comment_bytes = comment_bytes.checked_add(payload).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "JPEG comments are too large")
+            })?;
+        }
+        reader.seek(SeekFrom::Current(payload as i64))?;
+    }
+
+    Ok((comment_bytes > 0).then_some(("JPEG comment metadata", comment_bytes)))
+}
+
+fn scan_gif_comments(reader: &mut (impl Read + Seek)) -> io::Result<Option<(&'static str, usize)>> {
+    let mut header = [0_u8; 13];
+    reader.read_exact(&mut header)?;
+    if &header[..6] != b"GIF87a" && &header[..6] != b"GIF89a" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid GIF signature",
+        ));
+    }
+    skip_gif_color_table(reader, header[10])?;
+
+    let mut comment_bytes = 0_usize;
+    loop {
+        let introducer = read_byte(reader)?;
+        match introducer {
+            0x21 => {
+                let label = read_byte(reader)?;
+                let bytes = skip_gif_sub_blocks(reader)?;
+                if label == 0xfe {
+                    comment_bytes = comment_bytes.checked_add(bytes).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "GIF comments are too large")
+                    })?;
+                }
+            }
+            0x2c => {
+                let mut descriptor = [0_u8; 9];
+                reader.read_exact(&mut descriptor)?;
+                skip_gif_color_table(reader, descriptor[8])?;
+                read_byte(reader)?;
+                skip_gif_sub_blocks(reader)?;
+            }
+            0x3b => break,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid GIF block introducer",
+                ));
+            }
+        }
+    }
+
+    Ok((comment_bytes > 0).then_some(("GIF comment metadata", comment_bytes)))
+}
+
+fn skip_gif_color_table(reader: &mut impl Seek, packed: u8) -> io::Result<()> {
+    if packed & 0x80 != 0 {
+        let entries = 1_u16 << (u32::from(packed & 0x07) + 1);
+        reader.seek(SeekFrom::Current(i64::from(entries) * 3))?;
+    }
+    Ok(())
+}
+
+fn skip_gif_sub_blocks(reader: &mut (impl Read + Seek)) -> io::Result<usize> {
+    let mut total = 0_usize;
+    loop {
+        let length = usize::from(read_byte(reader)?);
+        if length == 0 {
+            return Ok(total);
+        }
+        total = total.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "GIF extension is too large")
+        })?;
+        reader.seek(SeekFrom::Current(length as i64))?;
+    }
+}
+
+fn read_byte(reader: &mut impl Read) -> io::Result<u8> {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
+
+fn read_u16_be(reader: &mut impl Read) -> io::Result<u16> {
+    let mut bytes = [0_u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn read_u32_be(reader: &mut impl Read) -> io::Result<u32> {
+    let mut bytes = [0_u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
 }
 
 fn check_metadata_size(name: &str, metadata: Option<&[u8]>) -> Result<(), ProcessError> {
@@ -655,7 +866,7 @@ fn image_format(format: SupportedFormat) -> ImageFormat {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{io::Write, path::PathBuf};
 
     use image::{Rgba, RgbaImage};
 
@@ -687,6 +898,64 @@ mod tests {
             ]);
         }
         image.save_with_format(path, ImageFormat::Png).unwrap();
+    }
+
+    fn insert_png_text_chunk(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let iend = bytes
+            .windows(4)
+            .rposition(|window| window == b"IEND")
+            .unwrap()
+            - 4;
+        let kind = *b"tEXt";
+        let contents = b"Comment\0native PNG text";
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&(contents.len() as u32).to_be_bytes());
+        chunk.extend_from_slice(&kind);
+        chunk.extend_from_slice(contents);
+        chunk.extend_from_slice(&png_crc(kind, contents).to_be_bytes());
+
+        let mut output = Vec::with_capacity(bytes.len() + chunk.len());
+        output.extend_from_slice(&bytes[..iend]);
+        output.extend_from_slice(&chunk);
+        output.extend_from_slice(&bytes[iend..]);
+        std::fs::write(path, output).unwrap();
+    }
+
+    fn png_crc(kind: [u8; 4], contents: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in kind.iter().chain(contents) {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    fn insert_jpeg_comment(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let comment = b"native JPEG comment";
+        let mut output = Vec::with_capacity(bytes.len() + comment.len() + 4);
+        output.extend_from_slice(&bytes[..2]);
+        output.extend_from_slice(&[0xff, 0xfe]);
+        output.extend_from_slice(&((comment.len() + 2) as u16).to_be_bytes());
+        output.extend_from_slice(comment);
+        output.extend_from_slice(&bytes[2..]);
+        std::fs::write(path, output).unwrap();
+    }
+
+    fn insert_gif_comment(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let trailer = bytes.iter().rposition(|byte| *byte == 0x3b).unwrap();
+        let comment = b"native GIF comment";
+        let mut output = Vec::with_capacity(bytes.len() + comment.len() + 4);
+        output.extend_from_slice(&bytes[..trailer]);
+        output.extend_from_slice(&[0x21, 0xfe, comment.len() as u8]);
+        output.extend_from_slice(comment);
+        output.push(0);
+        output.extend_from_slice(&bytes[trailer..]);
+        std::fs::write(path, output).unwrap();
     }
 
     #[test]
@@ -759,6 +1028,56 @@ mod tests {
         assert!(candidate.warnings.iter().any(|warning| {
             warning.contains("GPS") && warning.contains("--preserve-all-metadata")
         }));
+    }
+
+    #[test]
+    fn preserve_all_rejects_native_text_metadata_that_cannot_be_reencoded() {
+        type MetadataCase = (&'static str, ImageFormat, fn(&Path));
+
+        let directory = tempfile::tempdir().unwrap();
+        let cases: [MetadataCase; 3] = [
+            ("text.png", ImageFormat::Png, insert_png_text_chunk),
+            ("comment.jpg", ImageFormat::Jpeg, insert_jpeg_comment),
+            ("comment.gif", ImageFormat::Gif, insert_gif_comment),
+        ];
+
+        for (name, format, add_metadata) in cases {
+            let path = directory.path().join(name);
+            let image = image::RgbImage::from_fn(240, 120, |x, y| {
+                image::Rgb([
+                    x.wrapping_mul(17).wrapping_add(y.wrapping_mul(3)) as u8,
+                    x.wrapping_mul(5).wrapping_add(y.wrapping_mul(13)) as u8,
+                    x.wrapping_mul(23).wrapping_add(y.wrapping_mul(29)) as u8,
+                ])
+            });
+            let mut file = File::create(&path).unwrap();
+            DynamicImage::ImageRgb8(image)
+                .write_to(&mut file, format)
+                .unwrap();
+            file.flush().unwrap();
+            add_metadata(&path);
+            let details = eligible_details(&path, Bounds::new(48, 24).unwrap());
+
+            let default_outcome = process_image(&path, &details, ProcessingOptions::default());
+            assert!(
+                matches!(default_outcome, ProcessingOutcome::Reduced(ref candidate) if candidate.warnings.iter().any(|warning| warning.contains("was removed"))),
+                "expected a native metadata removal warning for {name}, got {default_outcome:?}"
+            );
+
+            let outcome = process_image(
+                &path,
+                &details,
+                ProcessingOptions {
+                    preserve_all_metadata: true,
+                    ..ProcessingOptions::default()
+                },
+            );
+
+            assert!(
+                matches!(outcome, ProcessingOutcome::FidelityConflict { ref reason } if reason.contains("text") || reason.contains("comment")),
+                "expected a native metadata fidelity conflict for {name}, got {outcome:?}"
+            );
+        }
     }
 
     #[test]

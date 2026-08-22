@@ -18,6 +18,35 @@ fn write_source(path: &std::path::Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
 }
 
+fn add_png_text(path: &std::path::Path) {
+    let bytes = std::fs::read(path).unwrap();
+    let iend = bytes
+        .windows(4)
+        .rposition(|window| window == b"IEND")
+        .unwrap()
+        - 4;
+    let kind = *b"tEXt";
+    let contents = b"Comment\0native PNG text";
+    let mut crc = u32::MAX;
+    for byte in kind.iter().chain(contents) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(&(contents.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(&kind);
+    chunk.extend_from_slice(contents);
+    chunk.extend_from_slice(&(!crc).to_be_bytes());
+    let mut output = Vec::with_capacity(bytes.len() + chunk.len());
+    output.extend_from_slice(&bytes[..iend]);
+    output.extend_from_slice(&chunk);
+    output.extend_from_slice(&bytes[iend..]);
+    std::fs::write(path, output).unwrap();
+}
+
 #[test]
 fn preservation_mode_reduces_only_eligible_images() {
     let parent = tempfile::tempdir().unwrap();
@@ -139,4 +168,41 @@ fn replacement_requires_confirmation_and_yes_bypasses_it() {
         String::from_utf8_lossy(&accepted.stderr)
     );
     assert_eq!(image::open(path).unwrap().dimensions(), (60, 30));
+}
+
+#[test]
+fn preserve_all_reports_unrepresentable_png_text_as_a_fidelity_conflict() {
+    let parent = tempfile::tempdir().unwrap();
+    let source = parent.path().join("source");
+    let output = parent.path().join("reduced");
+    std::fs::create_dir(&source).unwrap();
+    let path = source.join("metadata.png");
+    write_source(&path);
+    add_png_text(&path);
+
+    let result = binary()
+        .args([
+            source.to_str().unwrap(),
+            "--max",
+            "60x30",
+            "--output",
+            output.to_str().unwrap(),
+            "--preserve-all-metadata",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["summary"]["reduced"], 0);
+    assert_eq!(report["summary"]["skipped"], 1);
+    assert_eq!(report["processing"][0]["outcome"], "fidelity_conflict");
+    assert!(
+        report["processing"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("PNG text metadata")
+    );
+    assert!(!output.join("metadata.png").exists());
 }
