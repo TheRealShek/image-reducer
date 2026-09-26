@@ -75,5 +75,5 @@ cargo clippy --all-targets -- -D warnings
 cargo deny check advisories licenses sources
 ```
 
-The requirements and safety terminology are documented in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) and [`CONTEXT.md`](CONTEXT.md).
+Product behavior and safety terms are documented in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
 Use [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) to calibrate release defaults against a representative personal image corpus before tagging a release.
