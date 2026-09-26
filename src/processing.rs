@@ -21,14 +21,12 @@ pub const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessingOptions {
     pub jpeg_quality: u8,
-    pub preserve_all_metadata: bool,
 }
 
 impl Default for ProcessingOptions {
     fn default() -> Self {
         Self {
             jpeg_quality: DEFAULT_JPEG_QUALITY,
-            preserve_all_metadata: false,
         }
     }
 }
@@ -120,13 +118,7 @@ fn process_image_inner(
     ensure_supported_color(source_color, details.format)?;
     let source_has_alpha = decoder.color_type().has_alpha();
     let orientation = decoder.orientation().map_err(ProcessError::failure)?;
-    let metadata = read_metadata(
-        &mut decoder,
-        orientation,
-        details.format,
-        native_text,
-        options,
-    )?;
+    let metadata = read_metadata(&mut decoder, native_text)?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(ProcessError::failure)?;
     image.apply_orientation(orientation);
     if image.dimensions()
@@ -227,10 +219,7 @@ fn ensure_supported_color(
 
 fn read_metadata(
     decoder: &mut impl ImageDecoder,
-    orientation: Orientation,
-    format: SupportedFormat,
     native_text: Option<&'static str>,
-    options: ProcessingOptions,
 ) -> Result<Metadata, ProcessError> {
     let icc = decoder.icc_profile().map_err(ProcessError::failure)?;
     check_metadata_size("ICC profile", icc.as_deref())?;
@@ -242,74 +231,29 @@ fn read_metadata(
     let iptc = decoder.iptc_metadata().map_err(ProcessError::failure)?;
     check_metadata_size("IPTC metadata", iptc.as_deref())?;
 
-    if options.preserve_all_metadata {
-        if let Some(description) = native_text {
-            return Err(ProcessError::fidelity(format!(
-                "preserve-all mode cannot safely re-encode {description}"
-            )));
-        }
-        if xmp.is_some() {
-            return Err(ProcessError::fidelity(
-                "preserve-all mode cannot safely re-encode XMP metadata for this image",
-            ));
-        }
-        if iptc.is_some() {
-            return Err(ProcessError::fidelity(
-                "preserve-all mode cannot safely re-encode IPTC metadata for this image",
-            ));
-        }
-    }
-
     let exif = match raw_exif {
-        Some(mut raw) if options.preserve_all_metadata => {
-            let removed = Orientation::remove_from_exif_chunk(&mut raw);
-            if orientation != Orientation::NoTransforms && removed.is_none() {
-                return Err(ProcessError::fidelity(
-                    "stored orientation could not be normalized in EXIF metadata",
-                ));
-            }
-            Some(raw)
-        }
         Some(raw) => capture_date_exif(&raw)?,
         None => None,
     };
 
     let mut warnings = Vec::new();
-    if !options.preserve_all_metadata {
-        if let Some(description) = native_text {
-            warnings.push(format!(
-                "{description} was removed. Use --preserve-all-metadata to require retention."
-            ));
-        }
-        if had_exif {
-            warnings.push(
-                "EXIF metadata was reduced to capture date; GPS and other fields were removed. Use --preserve-all-metadata to require retention."
-                    .to_owned(),
-            );
-        }
-        if xmp.is_some() {
-            warnings.push(
-                "XMP metadata was removed. Use --preserve-all-metadata to require retention."
-                    .to_owned(),
-            );
-        }
-        if iptc.is_some() {
-            warnings.push(
-                "IPTC metadata was removed. Use --preserve-all-metadata to require retention."
-                    .to_owned(),
-            );
-        }
+    if let Some(description) = native_text {
+        warnings.push(format!(
+            "{description} was removed; use the preserved source or a backup if needed"
+        ));
     }
-
-    if exif.is_some()
-        && !matches!(
-            format,
-            SupportedFormat::Jpeg | SupportedFormat::Png | SupportedFormat::WebP
-        )
-    {
-        return Err(ProcessError::fidelity(format!(
-            "{format} encoder cannot preserve required EXIF metadata"
-        )));
+    if had_exif {
+        warnings.push("Output retains only the EXIF capture date; other fields, including GPS, are omitted if present. Use the preserved source or a backup if needed".to_owned());
+    }
+    if xmp.is_some() {
+        warnings.push(
+            "XMP metadata was removed; use the preserved source or a backup if needed".to_owned(),
+        );
+    }
+    if iptc.is_some() {
+        warnings.push(
+            "IPTC metadata was removed; use the preserved source or a backup if needed".to_owned(),
+        );
     }
 
     Ok(Metadata {
@@ -895,13 +839,16 @@ mod tests {
                 .is_some()
         );
         assert!(parsed.get_field(Tag::GPSLatitudeRef, In::PRIMARY).is_none());
-        assert!(candidate.warnings.iter().any(|warning| {
-            warning.contains("GPS") && warning.contains("--preserve-all-metadata")
-        }));
+        assert!(
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GPS"))
+        );
     }
 
     #[test]
-    fn preserve_all_rejects_native_text_metadata_that_cannot_be_reencoded() {
+    fn reports_native_text_metadata_removed_by_policy() {
         type MetadataCase = (&'static str, ImageFormat, fn(&Path));
 
         let directory = tempfile::tempdir().unwrap();
@@ -927,24 +874,10 @@ mod tests {
             add_metadata(&path);
             let details = eligible_details(&path, Bounds::new(48, 24).unwrap());
 
-            let default_outcome = process_image(&path, &details, ProcessingOptions::default());
+            let outcome = process_image(&path, &details, ProcessingOptions::default());
             assert!(
-                matches!(default_outcome, ProcessingOutcome::Reduced(ref candidate) if candidate.warnings.iter().any(|warning| warning.contains("was removed"))),
-                "expected a native metadata removal warning for {name}, got {default_outcome:?}"
-            );
-
-            let outcome = process_image(
-                &path,
-                &details,
-                ProcessingOptions {
-                    preserve_all_metadata: true,
-                    ..ProcessingOptions::default()
-                },
-            );
-
-            assert!(
-                matches!(outcome, ProcessingOutcome::FidelityConflict { ref reason } if reason.contains("text") || reason.contains("comment")),
-                "expected a native metadata fidelity conflict for {name}, got {outcome:?}"
+                matches!(outcome, ProcessingOutcome::Reduced(ref candidate) if candidate.warnings.iter().any(|warning| warning.contains("was removed"))),
+                "expected a native metadata removal warning for {name}, got {outcome:?}"
             );
         }
     }

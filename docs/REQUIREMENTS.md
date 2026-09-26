@@ -21,7 +21,6 @@ image-reducer SOURCE [--max WIDTHxHEIGHT]
                      [--output DIRECTORY | --replace]
                      [--exclude RELATIVE_DIRECTORY]...
                      [--quality 1-100]
-                     [--preserve-all-metadata]
                      [--dry-run]
                      [--yes]
                      [--jobs COUNT]
@@ -96,7 +95,7 @@ Replacement mode requires explicit `--replace` selection.
 - Normalize visual orientation before downscaling and prevent double rotation in the result.
 - Use high-quality, color-aware, transparency-safe resampling. Throughput must not come from a lower-fidelity resize filter.
 - Preserve transparency, representable color information, capture date, and color profile.
-- Remove GPS metadata by default. `--preserve-all-metadata` retains location and other supported metadata, except metadata that must be normalized to represent the transformed pixels correctly.
+- Retain the EXIF capture date and ICC profile. Remove other metadata, including GPS, native text, XMP, and IPTC, and report removals for processed images.
 - Preserve filesystem modification time and permission bits. Preserve ownership during replacement when permitted.
 - Do not promise preservation of arbitrary extended attributes or access-control lists in the first release.
 - Skip an image when the encoder cannot retain required properties. Report the specific fidelity conflict.
@@ -177,7 +176,7 @@ Use Rust 2024 with a minimum supported Rust version of 1.89. Keep the applicatio
 
 The processing pipeline has three stages: bounded header-only discovery and planning; memory-budgeted parallel decode, orientation/color normalization, resize, encode, and verification; then synchronized atomic publication and reporting. Disable internal Rayon features in codec and resizing dependencies to prevent nested parallelism.
 
-Metadata is untrusted input and receives independent size limits. Default output reconstructs only promised metadata, removes GPS and opaque XMP that could duplicate location, and normalizes orientation. Preserve-all mode retains supported metadata only after round-trip verification. If metadata cannot be represented safely, skip the image. Do not use `little_exif` while its XML dependency remains below versions patched for RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
+Metadata is untrusted input and receives independent size limits. Output reconstructs only the promised capture date, removes GPS and opaque XMP that could duplicate location, retains ICC when representable, and normalizes orientation. If required metadata cannot be represented safely, skip the image. Do not use `little_exif` while its XML dependency remains below versions patched for RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
 
 The portable WebP backend encodes losslessly. Do not add native `libwebp` to v1 merely to expose lossy quality control; reconsider it only if benchmarks show that too many WebP reductions fail the beneficial-reduction gate.
 

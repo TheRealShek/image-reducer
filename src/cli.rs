@@ -45,10 +45,6 @@ pub struct Cli {
     )]
     pub quality: Option<u8>,
 
-    /// Require supported metadata retention; skip images that cannot retain it
-    #[arg(long)]
-    pub preserve_all_metadata: bool,
-
     /// Discover and report planned work without writing anything
     #[arg(long)]
     pub dry_run: bool,

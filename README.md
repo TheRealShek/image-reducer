@@ -61,7 +61,7 @@ Use `--json` for a structured report and `--jobs` to set the worker limit. `--ma
 
 JPEG uses a high-fidelity quality default of 92. `--quality` changes JPEG encoding only; WebP is encoded losslessly, and lossless formats ignore it.
 
-Default metadata handling retains the EXIF capture date and ICC profile, normalizes orientation, and removes GPS and opaque XMP metadata. `--preserve-all-metadata` retains supported EXIF metadata, including GPS, but skips an image with a fidelity conflict when its metadata cannot be safely re-encoded.
+The metadata policy retains the EXIF capture date and ICC profile, normalizes orientation, and removes other metadata, including GPS, native text, XMP, and IPTC. The tool reports removals for processed images. Review this policy before using `--replace`.
 
 ## Exit status
 
