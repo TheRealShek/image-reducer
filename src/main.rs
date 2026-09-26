@@ -66,7 +66,6 @@ fn run() -> image_reducer::Result<bool> {
                 jobs: cli.jobs.map(std::num::NonZeroUsize::get),
                 processing: ProcessingOptions {
                     jpeg_quality: cli.quality.unwrap_or(DEFAULT_JPEG_QUALITY),
-                    preserve_all_metadata: cli.preserve_all_metadata,
                 },
                 show_progress: !cli.json && io::stderr().is_terminal(),
             },
@@ -110,6 +109,9 @@ fn print_pre_run_plan(plan: &Plan, eligible: usize) {
     eprintln!("Plan: {}", plan.source.display());
     eprintln!("Target bounds: {} (orientation-aware)", plan.bounds);
     eprintln!("Eligible images: {eligible}");
+    eprintln!(
+        "Metadata: retain capture date and ICC profile; remove other metadata, including GPS. Use preservation mode if you need the source metadata."
+    );
     match &plan.mode {
         Mode::Preserve { output, .. } => {
             eprintln!("Output: {} (sources remain unchanged)", output.display());
