@@ -56,11 +56,8 @@ The initial release supports single-image files that can be decoded and safely r
 - JPEG
 - PNG
 - WebP
-- BMP
-- single-page TIFF
-- single-frame GIF
 
-AVIF may be offered as optional support if it does not complicate the normal portable build. Animated images, multi-page containers, HEIC/HEIF, camera RAW, SVG, and other unsupported formats are skipped and reported. The tool never processes only the first frame or page of a multi-image file.
+AVIF may be offered as optional support if it does not complicate the normal portable build. GIF, TIFF, BMP, animated images, multi-page containers, HEIC/HEIF, camera RAW, SVG, and other unsupported formats are skipped and reported. The tool never processes only the first frame or page of a multi-image file.
 
 ## Processing modes
 
@@ -167,7 +164,7 @@ Use Rust 2024 with a minimum supported Rust version of 1.89. Keep the applicatio
 |---|---|
 | CLI | `clap` with typed arguments |
 | Traversal | `walkdir`, with link following disabled and exact subtree exclusions |
-| Codecs | `image` with default features disabled and only JPEG, PNG, WebP, BMP, TIFF, and GIF enabled |
+| Codecs | `image` with default features disabled and only JPEG, PNG, and WebP enabled |
 | Resizing | `fast_image_resize` using SIMD Lanczos3, alpha-aware processing, and linear-light mapping |
 | ICC color | `moxcms` pure-Rust color transforms |
 | Metadata | `image` metadata APIs, `img-parts` container handling, and isolated `kamadak-exif` parsing/reconstruction |

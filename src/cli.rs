@@ -13,7 +13,7 @@ use crate::{Error, Result, plan::Bounds};
     name = "image-reducer",
     version,
     about = "Safely downscale oversized images without changing sources by default",
-    long_about = "Safely downscale oversized images without changing sources by default.\n\nThe plain command recursively finds supported images, uses orientation-aware 1920x1080 bounds, and writes only verified, smaller results to a new sibling directory such as SOURCE-reduced. Files that are within bounds are left untouched and are not copied.\n\nSupported formats: JPEG, PNG, WebP, BMP, single-page TIFF, and single-frame GIF.",
+    long_about = "Safely downscale oversized images without changing sources by default.\n\nThe plain command recursively finds supported images, uses orientation-aware 1920x1080 bounds, and writes only verified, smaller results to a new sibling directory such as SOURCE-reduced. Files that are within bounds are left untouched and are not copied.\n\nSupported formats: JPEG, PNG, and WebP.",
     after_help = "COMMON WORKFLOWS:\n  Preview only (never writes):\n    image-reducer PHOTOS --dry-run\n\n  Preserve sources (default):\n    image-reducer PHOTOS\n    Writes reductions to a new sibling such as PHOTOS-reduced.\n\n  Use custom bounds and output directory:\n    image-reducer PHOTOS --max 2560x1440 --output /path/to/NEW_OUTPUT\n\n  Replace sources (irreversible; asks for confirmation):\n    image-reducer PHOTOS --replace\n\nSAFETY:\n  Start with --dry-run. The default mode never changes source files.\n  --replace permanently discards each higher-resolution source only after its\n  reduction is verified and durably published. Use --yes only for automation."
 )]
 pub struct Cli {
@@ -204,7 +204,7 @@ mod tests {
         for expected in [
             "without changing sources by default",
             "orientation-aware 1920x1080 bounds",
-            "Supported formats: JPEG, PNG, WebP, BMP, single-page TIFF, and single-frame GIF",
+            "Supported formats: JPEG, PNG, and WebP",
             "image-reducer PHOTOS --dry-run",
             "image-reducer PHOTOS --replace",
             "--replace permanently discards each higher-resolution source",

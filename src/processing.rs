@@ -209,7 +209,7 @@ fn ensure_supported_color(
             "JPEG color type {color:?} cannot be encoded without fidelity loss"
         )));
     }
-    if matches!(format, SupportedFormat::WebP | SupportedFormat::Bmp)
+    if format == SupportedFormat::WebP
         && !matches!(
             color,
             ExtendedColorType::L8
@@ -220,20 +220,6 @@ fn ensure_supported_color(
     {
         return Err(ProcessError::fidelity(format!(
             "{format} color type {color:?} cannot be encoded without fidelity loss"
-        )));
-    }
-    if format == SupportedFormat::Gif
-        && !matches!(color, ExtendedColorType::Rgb8 | ExtendedColorType::Rgba8)
-    {
-        return Err(ProcessError::fidelity(format!(
-            "GIF color type {color:?} cannot be encoded without fidelity loss"
-        )));
-    }
-    if format == SupportedFormat::Tiff
-        && matches!(color, ExtendedColorType::La8 | ExtendedColorType::La16)
-    {
-        return Err(ProcessError::fidelity(format!(
-            "TIFF color type {color:?} cannot be encoded without fidelity loss"
         )));
     }
     Ok(())
@@ -325,11 +311,6 @@ fn read_metadata(
             "{format} encoder cannot preserve required EXIF metadata"
         )));
     }
-    if icc.is_some() && matches!(format, SupportedFormat::Bmp | SupportedFormat::Gif) {
-        return Err(ProcessError::fidelity(format!(
-            "{format} encoder cannot preserve the ICC color profile"
-        )));
-    }
 
     Ok(Metadata {
         icc,
@@ -346,8 +327,7 @@ fn read_native_text_metadata(
     let found = match format {
         SupportedFormat::Png => scan_png_text_chunks(&mut reader),
         SupportedFormat::Jpeg => scan_jpeg_comments(&mut reader),
-        SupportedFormat::Gif => scan_gif_comments(&mut reader),
-        SupportedFormat::WebP | SupportedFormat::Bmp | SupportedFormat::Tiff => return Ok(None),
+        SupportedFormat::WebP => return Ok(None),
     }
     .map_err(|error| {
         ProcessError::failure(format!("cannot inspect native text metadata: {error}"))
@@ -443,78 +423,6 @@ fn scan_jpeg_comments(
     }
 
     Ok((comment_bytes > 0).then_some(("JPEG comment metadata", comment_bytes)))
-}
-
-fn scan_gif_comments(reader: &mut (impl Read + Seek)) -> io::Result<Option<(&'static str, usize)>> {
-    let mut header = [0_u8; 13];
-    reader.read_exact(&mut header)?;
-    if &header[..6] != b"GIF87a" && &header[..6] != b"GIF89a" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid GIF signature",
-        ));
-    }
-    skip_gif_color_table(reader, header[10])?;
-
-    let mut comment_bytes = 0_usize;
-    loop {
-        let introducer = read_byte(reader)?;
-        match introducer {
-            0x21 => {
-                let label = read_byte(reader)?;
-                let bytes = skip_gif_sub_blocks(reader)?;
-                if label == 0xfe {
-                    comment_bytes = comment_bytes.checked_add(bytes).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "GIF comments are too large")
-                    })?;
-                }
-            }
-            0x2c => {
-                let mut descriptor = [0_u8; 9];
-                reader.read_exact(&mut descriptor)?;
-                skip_gif_color_table(reader, descriptor[8])?;
-                read_byte(reader)?;
-                skip_gif_sub_blocks(reader)?;
-            }
-            0x3b => break,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid GIF block introducer",
-                ));
-            }
-        }
-    }
-
-    Ok((comment_bytes > 0).then_some(("GIF comment metadata", comment_bytes)))
-}
-
-fn skip_gif_color_table(reader: &mut impl Seek, packed: u8) -> io::Result<()> {
-    if packed & 0x80 != 0 {
-        let entries = 1_u16 << (u32::from(packed & 0x07) + 1);
-        reader.seek(SeekFrom::Current(i64::from(entries) * 3))?;
-    }
-    Ok(())
-}
-
-fn skip_gif_sub_blocks(reader: &mut (impl Read + Seek)) -> io::Result<usize> {
-    let mut total = 0_usize;
-    loop {
-        let length = usize::from(read_byte(reader)?);
-        if length == 0 {
-            return Ok(total);
-        }
-        total = total.checked_add(length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "GIF extension is too large")
-        })?;
-        reader.seek(SeekFrom::Current(length as i64))?;
-    }
-}
-
-fn read_byte(reader: &mut impl Read) -> io::Result<u8> {
-    let mut byte = [0_u8; 1];
-    reader.read_exact(&mut byte)?;
-    Ok(byte[0])
 }
 
 fn read_u16_be(reader: &mut impl Read) -> io::Result<u16> {
@@ -708,28 +616,6 @@ fn encode(
                 .write_image(image.as_bytes(), width, height, color)
                 .map_err(ProcessError::failure)?;
         }
-        SupportedFormat::Bmp => {
-            image::codecs::bmp::BmpEncoder::new(&mut output)
-                .write_image(image.as_bytes(), width, height, color)
-                .map_err(ProcessError::failure)?;
-        }
-        SupportedFormat::Tiff => {
-            let mut cursor = Cursor::new(&mut output);
-            let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut cursor);
-            if let Some(icc) = &metadata.icc {
-                encoder
-                    .set_icc_profile(icc.clone())
-                    .map_err(ProcessError::fidelity)?;
-            }
-            encoder
-                .write_image(image.as_bytes(), width, height, color)
-                .map_err(ProcessError::failure)?;
-        }
-        SupportedFormat::Gif => {
-            image::codecs::gif::GifEncoder::new(&mut output)
-                .write_image(image.as_bytes(), width, height, color)
-                .map_err(ProcessError::failure)?;
-        }
     }
     Ok(output)
 }
@@ -797,7 +683,7 @@ fn verify(
     }
 
     let candidate = DynamicImage::from_decoder(decoder).map_err(ProcessError::failure)?;
-    if !matches!(details.format, SupportedFormat::Jpeg | SupportedFormat::Gif)
+    if details.format != SupportedFormat::Jpeg
         && (candidate.color() != resized.color() || candidate.as_bytes() != resized.as_bytes())
     {
         return Err(ProcessError::fidelity(
@@ -858,9 +744,6 @@ fn image_format(format: SupportedFormat) -> ImageFormat {
         SupportedFormat::Jpeg => ImageFormat::Jpeg,
         SupportedFormat::Png => ImageFormat::Png,
         SupportedFormat::WebP => ImageFormat::WebP,
-        SupportedFormat::Bmp => ImageFormat::Bmp,
-        SupportedFormat::Tiff => ImageFormat::Tiff,
-        SupportedFormat::Gif => ImageFormat::Gif,
     }
 }
 
@@ -945,19 +828,6 @@ mod tests {
         std::fs::write(path, output).unwrap();
     }
 
-    fn insert_gif_comment(path: &Path) {
-        let bytes = std::fs::read(path).unwrap();
-        let trailer = bytes.iter().rposition(|byte| *byte == 0x3b).unwrap();
-        let comment = b"native GIF comment";
-        let mut output = Vec::with_capacity(bytes.len() + comment.len() + 4);
-        output.extend_from_slice(&bytes[..trailer]);
-        output.extend_from_slice(&[0x21, 0xfe, comment.len() as u8]);
-        output.extend_from_slice(comment);
-        output.push(0);
-        output.extend_from_slice(&bytes[trailer..]);
-        std::fs::write(path, output).unwrap();
-    }
-
     #[test]
     fn creates_verified_beneficial_png_without_touching_source() {
         let directory = tempfile::tempdir().unwrap();
@@ -1035,10 +905,9 @@ mod tests {
         type MetadataCase = (&'static str, ImageFormat, fn(&Path));
 
         let directory = tempfile::tempdir().unwrap();
-        let cases: [MetadataCase; 3] = [
+        let cases: [MetadataCase; 2] = [
             ("text.png", ImageFormat::Png, insert_png_text_chunk),
             ("comment.jpg", ImageFormat::Jpeg, insert_jpeg_comment),
-            ("comment.gif", ImageFormat::Gif, insert_gif_comment),
         ];
 
         for (name, format, add_metadata) in cases {
@@ -1087,9 +956,6 @@ mod tests {
             ("photo.jpg", ImageFormat::Jpeg),
             ("photo.png", ImageFormat::Png),
             ("photo.webp", ImageFormat::WebP),
-            ("photo.bmp", ImageFormat::Bmp),
-            ("photo.tiff", ImageFormat::Tiff),
-            ("photo.gif", ImageFormat::Gif),
         ];
 
         for (name, format) in formats {

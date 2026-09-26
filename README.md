@@ -50,10 +50,10 @@ Use `--json` for a structured report and `--jobs` to set the worker limit. `--ma
 
 ## Behavior
 
-- JPEG, PNG, WebP, BMP, single-page TIFF, and single-frame GIF are detected from their contents.
+- JPEG, PNG, and WebP are detected from their contents. GIF, TIFF, BMP, and other formats are reported as unsupported.
 - Stored orientation is applied before dimensions are classified and is normalized in reduced output.
 - Images are never cropped, stretched, or enlarged.
-- Animated images, multi-page TIFFs, symbolic links, unsupported formats, and resource-guard violations are reported and skipped.
+- Animated images, symbolic links, unsupported formats, and resource-guard violations are reported and skipped.
 - A candidate is decoded and verified before publication. It is discarded when it is not smaller than its source.
 - Preservation output uses the source-relative path and retains modification time and permission bits.
 - Replacement uses a destination-local temporary file, durable synchronization, and atomic rename. The source is unchanged if candidate creation or verification fails.
