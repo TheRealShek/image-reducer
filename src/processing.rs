@@ -634,7 +634,7 @@ fn verify(
             "candidate pixel colors or transparency differ after round-trip verification",
         ));
     }
-    if source_has_alpha && alpha_samples(&candidate) != alpha_samples(resized) {
+    if source_has_alpha && !alpha_samples_match(&candidate, resized) {
         return Err(ProcessError::fidelity(
             "candidate transparency values differ after round-trip verification",
         ));
@@ -669,17 +669,25 @@ fn verify_container_metadata(
     Ok(())
 }
 
-fn alpha_samples(image: &DynamicImage) -> Option<Vec<u16>> {
-    match image {
-        DynamicImage::ImageLumaA8(buffer) => {
-            Some(buffer.pixels().map(|pixel| u16::from(pixel[1])).collect())
-        }
-        DynamicImage::ImageRgba8(buffer) => {
-            Some(buffer.pixels().map(|pixel| u16::from(pixel[3])).collect())
-        }
-        DynamicImage::ImageLumaA16(buffer) => Some(buffer.pixels().map(|pixel| pixel[1]).collect()),
-        DynamicImage::ImageRgba16(buffer) => Some(buffer.pixels().map(|pixel| pixel[3]).collect()),
-        _ => None,
+fn alpha_samples_match(candidate: &DynamicImage, resized: &DynamicImage) -> bool {
+    match (candidate, resized) {
+        (DynamicImage::ImageLumaA8(left), DynamicImage::ImageLumaA8(right)) => left
+            .pixels()
+            .map(|pixel| pixel[1])
+            .eq(right.pixels().map(|pixel| pixel[1])),
+        (DynamicImage::ImageRgba8(left), DynamicImage::ImageRgba8(right)) => left
+            .pixels()
+            .map(|pixel| pixel[3])
+            .eq(right.pixels().map(|pixel| pixel[3])),
+        (DynamicImage::ImageLumaA16(left), DynamicImage::ImageLumaA16(right)) => left
+            .pixels()
+            .map(|pixel| pixel[1])
+            .eq(right.pixels().map(|pixel| pixel[1])),
+        (DynamicImage::ImageRgba16(left), DynamicImage::ImageRgba16(right)) => left
+            .pixels()
+            .map(|pixel| pixel[3])
+            .eq(right.pixels().map(|pixel| pixel[3])),
+        _ => false,
     }
 }
 

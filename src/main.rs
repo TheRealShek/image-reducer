@@ -45,13 +45,12 @@ fn run() -> image_reducer::Result<bool> {
     if !cli.dry_run && matches!(plan.mode, Mode::Replace) && eligible > 0 && !cli.yes {
         confirm_replacement()?;
     }
-    if cli
+    if let Some(quality) = cli
         .quality
-        .is_some_and(|quality| quality < DEFAULT_JPEG_QUALITY)
+        .filter(|&quality| quality < DEFAULT_JPEG_QUALITY)
     {
         eprintln!(
-            "warning: JPEG quality {} is below the high-fidelity default of {DEFAULT_JPEG_QUALITY}",
-            cli.quality.unwrap()
+            "warning: JPEG quality {quality} is below the high-fidelity default of {DEFAULT_JPEG_QUALITY}"
         );
     }
 
