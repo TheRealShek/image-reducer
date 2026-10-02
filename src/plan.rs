@@ -1,3 +1,5 @@
+//! Validated source/output plans and aspect-ratio-preserving target dimensions.
+
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -10,6 +12,7 @@ pub const DEFAULT_LANDSCAPE_BOUNDS: Bounds = Bounds {
     height: 1080,
 };
 
+/// Landscape target limits, rotated for portrait images and squared for square images.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bounds {
     pub width: u32,
@@ -17,6 +20,7 @@ pub struct Bounds {
 }
 
 impl Bounds {
+    /// Validates nonzero, landscape-oriented target limits.
     pub fn new(width: u32, height: u32) -> Result<Self> {
         if width == 0 || height == 0 {
             return Err(Error::InvalidArgument(
@@ -31,6 +35,7 @@ impl Bounds {
         Ok(Self { width, height })
     }
 
+    /// Selects landscape, portrait, or square limits from the image dimensions.
     pub fn for_image(self, image_width: u32, image_height: u32) -> Self {
         match image_width.cmp(&image_height) {
             std::cmp::Ordering::Greater => self,
@@ -45,6 +50,8 @@ impl Bounds {
         }
     }
 
+    /// Fits image dimensions within the limits without cropping or upscaling.
+    /// Both input dimensions must be nonzero.
     pub fn fitted_dimensions(self, image_width: u32, image_height: u32) -> (u32, u32) {
         let bounds = self.for_image(image_width, image_height);
         if image_width <= bounds.width && image_height <= bounds.height {
@@ -71,12 +78,14 @@ impl fmt::Display for Bounds {
     }
 }
 
+/// Source-preserving output or explicitly requested source replacement.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Mode {
     Preserve { output: PathBuf, inferred: bool },
     Replace,
 }
 
+/// Validated source, target bounds, output policy, and relative exclusions.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Plan {
     pub source: PathBuf,
@@ -86,6 +95,7 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Validates CLI paths and chooses a source-preserving or replacement plan.
     pub fn from_cli(cli: &Cli) -> Result<Self> {
         cli.validate()?;
         let source = std::fs::canonicalize(&cli.source).map_err(|source| Error::Io {
@@ -117,6 +127,7 @@ impl Plan {
     }
 }
 
+/// Resolves exclusions and rejects symlinks or paths outside the source tree.
 fn validate_exclusions(source: &Path, exclusions: &[PathBuf]) -> Result<Vec<PathBuf>> {
     exclusions
         .iter()
@@ -152,6 +163,7 @@ fn validate_exclusions(source: &Path, exclusions: &[PathBuf]) -> Result<Vec<Path
         .collect()
 }
 
+/// Requires a new output path whose resolved location is outside the source.
 fn validate_explicit_output(source: &Path, output: &Path) -> Result<PathBuf> {
     let output = absolute_path(output)?;
     if output.exists() {
@@ -170,6 +182,7 @@ fn validate_explicit_output(source: &Path, output: &Path) -> Result<PathBuf> {
     Ok(output)
 }
 
+/// Resolves existing ancestors before appending nonexistent path components.
 fn resolve_nonexistent_path(path: &Path) -> Result<PathBuf> {
     let mut existing = path;
     let mut missing = Vec::new();
@@ -199,6 +212,7 @@ fn resolve_nonexistent_path(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Chooses the first unused sibling directory with a reduction suffix.
 fn infer_output(source: &Path) -> Result<PathBuf> {
     let parent = source.parent().ok_or_else(|| {
         Error::InvalidArgument(
@@ -230,6 +244,7 @@ fn infer_output(source: &Path) -> Result<PathBuf> {
     unreachable!("the output suffix space cannot be exhausted")
 }
 
+/// Makes a path absolute and normalizes its components lexically.
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(normalize_lexically(path));
@@ -241,6 +256,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(normalize_lexically(&current.join(path)))
 }
 
+/// Collapses dot and parent components without accessing the filesystem.
 fn normalize_lexically(path: &Path) -> PathBuf {
     use std::path::Component;
 

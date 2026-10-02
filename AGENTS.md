@@ -12,7 +12,8 @@ Image Reducer is a Linux Rust CLI that safely downscales oversized images. Sourc
 - `src/plan.rs`: target dimensions and preservation/replacement plans.
 - `src/processing.rs`: metadata policy, color/orientation normalization, resize, encoding, and candidate verification.
 - `src/runner.rs`: bounded concurrency, cancellation, memory budgeting, atomic publication, filesystem attributes, and per-file outcomes.
-- `src/main.rs`: confirmation, human/JSON reports, summaries, and exit status.
+- `src/main.rs`: startup, confirmation, orchestration, and exit status.
+- `src/report.rs`: private human/JSON reports and shared summaries.
 - `tests/cli.rs`: end-to-end CLI behavior.
 - `docs/BENCHMARKING.md`: required release calibration on representative x86-64 and ARM64 corpora.
 

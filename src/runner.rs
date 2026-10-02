@@ -1,3 +1,5 @@
+//! Bounded processing and durable publication anchored to directory handles.
+
 use std::{
     fs::{File, Permissions},
     io::Write,
@@ -33,6 +35,7 @@ const MIN_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 const ESTIMATED_BYTES_PER_PIXEL: u64 = 32;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Publication outcome and report details for one eligible source.
 #[derive(Debug)]
 pub enum EntryOutcome {
     Reduced {
@@ -55,6 +58,7 @@ pub enum EntryOutcome {
 }
 
 impl EntryOutcome {
+    /// Returns the stable report label for this processing outcome.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Reduced { .. } => "reduced",
@@ -66,18 +70,21 @@ impl EntryOutcome {
     }
 }
 
+/// Source-relative path paired with its processing/publication outcome.
 #[derive(Debug)]
 pub struct ProcessedEntry {
     pub relative_path: PathBuf,
     pub outcome: EntryOutcome,
 }
 
+/// Worker limit, processing policy, and terminal progress preference.
 pub struct RunOptions {
     pub jobs: Option<usize>,
     pub processing: ProcessingOptions,
     pub show_progress: bool,
 }
 
+/// Installs the process-wide signal handler and returns its shared cancellation flag.
 pub fn install_cancellation_handler() -> Result<Arc<AtomicBool>> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&cancelled);
@@ -88,6 +95,7 @@ pub fn install_cancellation_handler() -> Result<Arc<AtomicBool>> {
     Ok(cancelled)
 }
 
+/// Reads available physical memory from Linux procfs, when accessible.
 pub fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let available_kib = meminfo.lines().find_map(|line| {
@@ -97,6 +105,7 @@ pub fn available_memory_bytes() -> Option<u64> {
     available_kib.checked_mul(1024)
 }
 
+/// Selects a bounded pixel guard from available memory or the fallback limit.
 pub fn default_max_pixels() -> u64 {
     available_memory_bytes()
         .map(|bytes| bytes / ESTIMATED_BYTES_PER_PIXEL)
@@ -104,6 +113,7 @@ pub fn default_max_pixels() -> u64 {
         .clamp(1_000_000, crate::inspection::DEFAULT_MAX_PIXELS)
 }
 
+/// Processes eligible images in one bounded pool and publishes only verified reductions.
 pub fn execute(
     plan: &Plan,
     inspected: &[InspectedEntry],
@@ -233,12 +243,14 @@ pub fn execute(
     Ok(results)
 }
 
+/// Open source/output directory handles that anchor publication paths.
 struct PublishRoots {
     source: File,
     output: Option<File>,
 }
 
 impl PublishRoots {
+    /// Opens source/output handles with final-component symlink checks.
     fn open(plan: &Plan) -> Result<Self> {
         let source = open_directory(&plan.source)?;
         let output = match &plan.mode {
@@ -249,6 +261,7 @@ impl PublishRoots {
     }
 }
 
+/// Opens a directory handle while rejecting a symlink at the final component.
 fn open_directory(path: &Path) -> Result<File> {
     open(
         path,
@@ -262,6 +275,7 @@ fn open_directory(path: &Path) -> Result<File> {
     })
 }
 
+/// Rechecks source identity and publishes through anchored source/output parents.
 fn publish(
     plan: &Plan,
     roots: &PublishRoots,
@@ -338,6 +352,7 @@ fn publish(
     }
 }
 
+/// Durably publishes bytes, retaining the displaced source until replacement is accepted.
 fn publish_file(
     parent: &File,
     destination: &std::ffi::OsStr,
@@ -460,6 +475,7 @@ fn publish_file(
     }
 }
 
+/// Opens relative parents without following symlinks, optionally creating output directories.
 fn open_relative_parent<'a>(
     root: &File,
     relative_path: &'a Path,
@@ -509,6 +525,7 @@ fn open_relative_parent<'a>(
     Ok((current, file_name))
 }
 
+/// Exclusive destination-local output whose guard retains a displaced source after exchange.
 struct TemporaryFile<'a> {
     parent: &'a File,
     name: String,
@@ -517,6 +534,7 @@ struct TemporaryFile<'a> {
 }
 
 impl<'a> TemporaryFile<'a> {
+    /// Creates an exclusive temporary file beneath the already-open destination parent.
     fn new(parent: &'a File) -> std::io::Result<Self> {
         loop {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -550,10 +568,12 @@ impl Drop for TemporaryFile<'_> {
     }
 }
 
+/// Synchronizes a directory entry after output-root creation.
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+/// Weighted limit shared by all workers in the dedicated Rayon pool.
 struct MemoryBudget {
     limit: u64,
     used: Mutex<u64>,
@@ -561,6 +581,7 @@ struct MemoryBudget {
 }
 
 impl MemoryBudget {
+    /// Creates a shared weighted budget for decoded-image work.
     fn new(limit: u64) -> Self {
         Self {
             limit,
@@ -569,6 +590,7 @@ impl MemoryBudget {
         }
     }
 
+    /// Waits for capacity and returns a permit; oversized work takes the whole budget.
     fn acquire(&self, requested: u64) -> MemoryPermit<'_> {
         let weight = requested.clamp(1, self.limit);
         let mut used = self.used.lock().unwrap_or_else(|error| error.into_inner());
@@ -586,6 +608,7 @@ impl MemoryBudget {
     }
 }
 
+/// Reserved weight returned to the memory budget when processing leaves scope.
 struct MemoryPermit<'a> {
     budget: &'a MemoryBudget,
     weight: u64,

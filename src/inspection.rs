@@ -1,3 +1,5 @@
+//! Header inspection, orientation-aware classification, and source fingerprints.
+
 use std::{
     fmt,
     fs::File,
@@ -12,6 +14,7 @@ use crate::plan::Bounds;
 
 pub const DEFAULT_MAX_PIXELS: u64 = 100_000_000;
 
+/// Static image formats that the processing pipeline can preserve.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportedFormat {
     Jpeg,
@@ -23,6 +26,7 @@ pub enum SupportedFormat {
 }
 
 impl SupportedFormat {
+    /// Returns the stable report label for this value.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Jpeg => "JPEG",
@@ -34,6 +38,7 @@ impl SupportedFormat {
         }
     }
 
+    /// Lists filename extensions recognized for this content-detected format.
     fn extensions(self) -> &'static [&'static str] {
         match self {
             Self::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
@@ -52,6 +57,7 @@ impl fmt::Display for SupportedFormat {
     }
 }
 
+/// Pixel width and height before or after orientation and resizing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Dimensions {
     pub width: u32,
@@ -70,6 +76,7 @@ impl fmt::Display for Dimensions {
     }
 }
 
+/// Inspected image properties and the planned reduction, before pixel decoding.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ImageDetails {
     pub format: SupportedFormat,
@@ -83,6 +90,7 @@ pub struct ImageDetails {
     pub extension_warning: Option<String>,
 }
 
+/// File identity, size, and modification time used to detect source changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceFingerprint {
     device: u64,
@@ -93,6 +101,7 @@ pub struct SourceFingerprint {
 }
 
 impl SourceFingerprint {
+    /// Records the file identity and change indicators used during publication.
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
@@ -103,15 +112,18 @@ impl SourceFingerprint {
         }
     }
 
+    /// Checks whether the current path still has the inspected fingerprint.
     pub fn matches_path(self, path: &Path) -> std::io::Result<bool> {
         std::fs::metadata(path).map(|metadata| self == Self::from_metadata(&metadata))
     }
 
+    /// Checks metadata from an already-open file against the inspected fingerprint.
     pub(crate) fn matches_metadata(self, metadata: &std::fs::Metadata) -> bool {
         self == Self::from_metadata(metadata)
     }
 }
 
+/// Inspection outcome, including intentional skips and per-file failures.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Classification {
     Eligible(ImageDetails),
@@ -121,6 +133,7 @@ pub enum Classification {
 }
 
 impl Classification {
+    /// Returns the category without moving the inspected image details.
     pub fn kind(&self) -> ClassificationKind {
         match self {
             Self::Eligible(_) => ClassificationKind::Eligible,
@@ -131,6 +144,7 @@ impl Classification {
     }
 }
 
+/// Stable category used to count and report inspection outcomes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClassificationKind {
     Eligible,
@@ -140,6 +154,7 @@ pub enum ClassificationKind {
 }
 
 impl ClassificationKind {
+    /// Returns the stable report label for this value.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Eligible => "eligible",
@@ -150,12 +165,14 @@ impl ClassificationKind {
     }
 }
 
+/// Source-relative path paired with its inspection outcome.
 #[derive(Debug, Eq, PartialEq)]
 pub struct InspectedEntry {
     pub relative_path: PathBuf,
     pub classification: Classification,
 }
 
+/// Inspects each discovered path and retains failures as per-file outcomes.
 pub fn inspect_files(
     source: &Path,
     files: &[PathBuf],
@@ -176,6 +193,7 @@ pub fn inspect_files(
         .collect()
 }
 
+/// Detects content format and guards pixel counts before planning a reduction.
 fn inspect_file(
     path: &Path,
     bounds: Bounds,
@@ -240,6 +258,7 @@ fn inspect_file(
     }
 }
 
+/// Maps codec formats to the supported static-image scope.
 fn supported_format(format: ImageFormat) -> Option<SupportedFormat> {
     match format {
         ImageFormat::Jpeg => Some(SupportedFormat::Jpeg),
@@ -252,6 +271,7 @@ fn supported_format(format: ImageFormat) -> Option<SupportedFormat> {
     }
 }
 
+/// Detects animation or multiple pages without decoding all pixel data.
 fn unsupported_container_reason(
     path: &Path,
     format: SupportedFormat,
@@ -308,6 +328,7 @@ fn unsupported_container_reason(
     }
 }
 
+/// Swaps dimensions for orientations that rotate by a quarter turn.
 fn displayed_dimensions(dimensions: Dimensions, orientation: Orientation) -> Dimensions {
     match orientation {
         Orientation::Rotate90
@@ -321,6 +342,7 @@ fn displayed_dimensions(dimensions: Dimensions, orientation: Orientation) -> Dim
     }
 }
 
+/// Warns when the filename extension disagrees with the detected format.
 fn extension_warning(path: &Path, format: SupportedFormat) -> Option<String> {
     let extension = path.extension()?.to_str()?;
     if format
