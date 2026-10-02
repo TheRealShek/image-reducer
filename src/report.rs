@@ -13,6 +13,9 @@ pub(super) fn print_pre_run_plan(plan: &Plan, eligible: usize) {
     eprintln!("Plan: {}", plan.source.display());
     eprintln!("Target bounds: {} (orientation-aware)", plan.bounds);
     eprintln!("Eligible images: {eligible}");
+    eprintln!(
+        "Metadata: retain capture date and ICC profile; remove other metadata, including GPS. Use preservation mode if you need the source metadata."
+    );
     match &plan.mode {
         Mode::Preserve { output, .. } => {
             eprintln!("Output: {} (sources remain unchanged)", output.display());

@@ -20,9 +20,6 @@ pub enum SupportedFormat {
     Jpeg,
     Png,
     WebP,
-    Bmp,
-    Tiff,
-    Gif,
 }
 
 impl SupportedFormat {
@@ -32,9 +29,6 @@ impl SupportedFormat {
             Self::Jpeg => "JPEG",
             Self::Png => "PNG",
             Self::WebP => "WebP",
-            Self::Bmp => "BMP",
-            Self::Tiff => "TIFF",
-            Self::Gif => "GIF",
         }
     }
 
@@ -44,9 +38,6 @@ impl SupportedFormat {
             Self::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             Self::Png => &["png"],
             Self::WebP => &["webp"],
-            Self::Bmp => &["bmp", "dib"],
-            Self::Tiff => &["tif", "tiff"],
-            Self::Gif => &["gif"],
         }
     }
 }
@@ -264,9 +255,6 @@ fn supported_format(format: ImageFormat) -> Option<SupportedFormat> {
         ImageFormat::Jpeg => Some(SupportedFormat::Jpeg),
         ImageFormat::Png => Some(SupportedFormat::Png),
         ImageFormat::WebP => Some(SupportedFormat::WebP),
-        ImageFormat::Bmp => Some(SupportedFormat::Bmp),
-        ImageFormat::Tiff => Some(SupportedFormat::Tiff),
-        ImageFormat::Gif => Some(SupportedFormat::Gif),
         _ => None,
     }
 }
@@ -283,25 +271,6 @@ fn unsupported_container_reason(
     };
 
     match format {
-        SupportedFormat::Gif => {
-            let mut options = gif::DecodeOptions::new();
-            options.skip_frame_decoding(true);
-            let mut decoder = options
-                .read_info(file()?)
-                .map_err(|error| error.to_string())?;
-            if decoder
-                .next_frame_info()
-                .map_err(|error| error.to_string())?
-                .is_none()
-            {
-                return Err("GIF contains no image frame".to_owned());
-            }
-            Ok(decoder
-                .next_frame_info()
-                .map_err(|error| error.to_string())?
-                .is_some()
-                .then(|| "animated GIF contains multiple frames".to_owned()))
-        }
         SupportedFormat::Png => {
             let decoder =
                 image::codecs::png::PngDecoder::new(file()?).map_err(|error| error.to_string())?;
@@ -317,14 +286,7 @@ fn unsupported_container_reason(
                 .has_animation()
                 .then(|| "animated WebP is outside the supported image scope".to_owned()))
         }
-        SupportedFormat::Tiff => {
-            let decoder =
-                tiff::decoder::Decoder::new(file()?).map_err(|error| error.to_string())?;
-            Ok(decoder
-                .more_images()
-                .then(|| "multi-page TIFF is outside the supported image scope".to_owned()))
-        }
-        SupportedFormat::Jpeg | SupportedFormat::Bmp => Ok(None),
+        SupportedFormat::Jpeg => Ok(None),
     }
 }
 
@@ -486,58 +448,27 @@ mod tests {
     }
 
     #[test]
-    fn skips_animated_gif() {
+    fn skips_removed_formats_without_decoding_or_changing_sources() {
         let source = tempfile::tempdir().unwrap();
-        let path = source.path().join("animated.gif");
-        let mut file = File::create(&path).unwrap();
-        let mut encoder = gif::Encoder::new(&mut file, 2, 2, &[]).unwrap();
-        let mut first_pixels = vec![0; 2 * 2 * 4];
-        let mut second_pixels = vec![0; 2 * 2 * 4];
-        encoder
-            .write_frame(&gif::Frame::from_rgba_speed(2, 2, &mut first_pixels, 10))
-            .unwrap();
-        encoder
-            .write_frame(&gif::Frame::from_rgba_speed(2, 2, &mut second_pixels, 10))
-            .unwrap();
-        drop(encoder);
-
-        let inspected = inspect_files(
-            source.path(),
-            &[PathBuf::from("animated.gif")],
-            Bounds::new(1, 1).unwrap(),
-            DEFAULT_MAX_PIXELS,
-        );
-
-        assert!(matches!(
-            &inspected[0].classification,
-            Classification::Skipped { reason } if reason.contains("multiple frames")
-        ));
-    }
-
-    #[test]
-    fn skips_multi_page_tiff() {
-        let source = tempfile::tempdir().unwrap();
-        let path = source.path().join("pages.tiff");
-        let file = File::create(&path).unwrap();
-        let mut encoder = tiff::encoder::TiffEncoder::new(file).unwrap();
-        encoder
-            .write_image::<tiff::encoder::colortype::RGB8>(2, 2, &[0; 12])
-            .unwrap();
-        encoder
-            .write_image::<tiff::encoder::colortype::RGB8>(2, 2, &[0; 12])
-            .unwrap();
-        drop(encoder);
-
-        let inspected = inspect_files(
-            source.path(),
-            &[PathBuf::from("pages.tiff")],
-            Bounds::new(1, 1).unwrap(),
-            DEFAULT_MAX_PIXELS,
-        );
-
-        assert!(matches!(
-            &inspected[0].classification,
-            Classification::Skipped { reason } if reason.contains("multi-page")
-        ));
+        let formats: [(&str, &[u8]); 3] = [
+            ("photo.gif", b"GIF89a"),
+            ("photo.tiff", b"II\x2a\x00"),
+            ("photo.bmp", b"BM"),
+        ];
+        for (name, signature) in formats {
+            std::fs::write(source.path().join(name), signature).unwrap();
+            let inspected = inspect_files(
+                source.path(),
+                &[PathBuf::from(name)],
+                Bounds::new(1, 1).unwrap(),
+                DEFAULT_MAX_PIXELS,
+            );
+            assert!(
+                matches!(&inspected[0].classification, Classification::Skipped { reason } if reason.contains("unsupported")),
+                "expected {name} to be unsupported, got {:?}",
+                inspected[0].classification
+            );
+            assert_eq!(std::fs::read(source.path().join(name)).unwrap(), signature);
+        }
     }
 }

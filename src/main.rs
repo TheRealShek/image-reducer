@@ -70,7 +70,6 @@ fn run() -> image_reducer::Result<bool> {
                 jobs: cli.jobs.map(std::num::NonZeroUsize::get),
                 processing: ProcessingOptions {
                     jpeg_quality: cli.quality.unwrap_or(DEFAULT_JPEG_QUALITY),
-                    preserve_all_metadata: cli.preserve_all_metadata,
                 },
                 show_progress: !cli.json && io::stderr().is_terminal(),
             },

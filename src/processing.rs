@@ -21,18 +21,16 @@ use crate::inspection::{Dimensions, ImageDetails, SupportedFormat};
 pub const DEFAULT_JPEG_QUALITY: u8 = 92;
 pub const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
-/// JPEG quality and the required metadata-retention policy.
+/// JPEG encoding quality for the fixed capture-date and ICC retention policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessingOptions {
     pub jpeg_quality: u8,
-    pub preserve_all_metadata: bool,
 }
 
 impl Default for ProcessingOptions {
     fn default() -> Self {
         Self {
             jpeg_quality: DEFAULT_JPEG_QUALITY,
-            preserve_all_metadata: false,
         }
     }
 }
@@ -63,7 +61,7 @@ pub enum ProcessingOutcome {
     Failed { error: String },
 }
 
-/// Bounded metadata selected for encoding under the requested retention policy.
+/// Bounded capture-date and ICC metadata selected for encoding.
 #[derive(Default)]
 struct Metadata {
     icc: Option<Vec<u8>>,
@@ -150,13 +148,7 @@ fn process_image_inner(
     ensure_supported_color(source_color, details.format)?;
     let source_has_alpha = decoder.color_type().has_alpha();
     let orientation = decoder.orientation().map_err(ProcessError::failure)?;
-    let metadata = read_metadata(
-        &mut decoder,
-        orientation,
-        details.format,
-        native_text,
-        options,
-    )?;
+    let metadata = read_metadata(&mut decoder, native_text)?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(ProcessError::failure)?;
     image.apply_orientation(orientation);
     if image.dimensions()
@@ -240,7 +232,7 @@ fn ensure_supported_color(
             "JPEG color type {color:?} cannot be encoded without fidelity loss"
         )));
     }
-    if matches!(format, SupportedFormat::WebP | SupportedFormat::Bmp)
+    if format == SupportedFormat::WebP
         && !matches!(
             color,
             ExtendedColorType::L8
@@ -253,30 +245,13 @@ fn ensure_supported_color(
             "{format} color type {color:?} cannot be encoded without fidelity loss"
         )));
     }
-    if format == SupportedFormat::Gif
-        && !matches!(color, ExtendedColorType::Rgb8 | ExtendedColorType::Rgba8)
-    {
-        return Err(ProcessError::fidelity(format!(
-            "GIF color type {color:?} cannot be encoded without fidelity loss"
-        )));
-    }
-    if format == SupportedFormat::Tiff
-        && matches!(color, ExtendedColorType::La8 | ExtendedColorType::La16)
-    {
-        return Err(ProcessError::fidelity(format!(
-            "TIFF color type {color:?} cannot be encoded without fidelity loss"
-        )));
-    }
     Ok(())
 }
 
-/// Applies size limits, retention policy, and orientation normalization to metadata.
+/// Applies size limits, retains capture date and ICC, and reports discarded metadata.
 fn read_metadata(
     decoder: &mut impl ImageDecoder,
-    orientation: Orientation,
-    format: SupportedFormat,
     native_text: Option<&'static str>,
-    options: ProcessingOptions,
 ) -> Result<Metadata, ProcessError> {
     let icc = decoder.icc_profile().map_err(ProcessError::failure)?;
     check_metadata_size("ICC profile", icc.as_deref())?;
@@ -288,79 +263,29 @@ fn read_metadata(
     let iptc = decoder.iptc_metadata().map_err(ProcessError::failure)?;
     check_metadata_size("IPTC metadata", iptc.as_deref())?;
 
-    if options.preserve_all_metadata {
-        if let Some(description) = native_text {
-            return Err(ProcessError::fidelity(format!(
-                "preserve-all mode cannot safely re-encode {description}"
-            )));
-        }
-        if xmp.is_some() {
-            return Err(ProcessError::fidelity(
-                "preserve-all mode cannot safely re-encode XMP metadata for this image",
-            ));
-        }
-        if iptc.is_some() {
-            return Err(ProcessError::fidelity(
-                "preserve-all mode cannot safely re-encode IPTC metadata for this image",
-            ));
-        }
-    }
-
     let exif = match raw_exif {
-        Some(mut raw) if options.preserve_all_metadata => {
-            let removed = Orientation::remove_from_exif_chunk(&mut raw);
-            if orientation != Orientation::NoTransforms && removed.is_none() {
-                return Err(ProcessError::fidelity(
-                    "stored orientation could not be normalized in EXIF metadata",
-                ));
-            }
-            Some(raw)
-        }
         Some(raw) => capture_date_exif(&raw)?,
         None => None,
     };
 
     let mut warnings = Vec::new();
-    if !options.preserve_all_metadata {
-        if let Some(description) = native_text {
-            warnings.push(format!(
-                "{description} was removed. Use --preserve-all-metadata to require retention."
-            ));
-        }
-        if had_exif {
-            warnings.push(
-                "EXIF metadata was reduced to capture date; GPS and other fields were removed. Use --preserve-all-metadata to require retention."
-                    .to_owned(),
-            );
-        }
-        if xmp.is_some() {
-            warnings.push(
-                "XMP metadata was removed. Use --preserve-all-metadata to require retention."
-                    .to_owned(),
-            );
-        }
-        if iptc.is_some() {
-            warnings.push(
-                "IPTC metadata was removed. Use --preserve-all-metadata to require retention."
-                    .to_owned(),
-            );
-        }
+    if let Some(description) = native_text {
+        warnings.push(format!(
+            "{description} was removed; use the preserved source or a backup if needed"
+        ));
     }
-
-    if exif.is_some()
-        && !matches!(
-            format,
-            SupportedFormat::Jpeg | SupportedFormat::Png | SupportedFormat::WebP
-        )
-    {
-        return Err(ProcessError::fidelity(format!(
-            "{format} encoder cannot preserve required EXIF metadata"
-        )));
+    if had_exif {
+        warnings.push("Output retains only the EXIF capture date; other fields, including GPS, are omitted if present. Use the preserved source or a backup if needed".to_owned());
     }
-    if icc.is_some() && matches!(format, SupportedFormat::Bmp | SupportedFormat::Gif) {
-        return Err(ProcessError::fidelity(format!(
-            "{format} encoder cannot preserve the ICC color profile"
-        )));
+    if xmp.is_some() {
+        warnings.push(
+            "XMP metadata was removed; use the preserved source or a backup if needed".to_owned(),
+        );
+    }
+    if iptc.is_some() {
+        warnings.push(
+            "IPTC metadata was removed; use the preserved source or a backup if needed".to_owned(),
+        );
     }
 
     Ok(Metadata {
@@ -379,8 +304,7 @@ fn read_native_text_metadata(
     let found = match format {
         SupportedFormat::Png => scan_png_text_chunks(&mut reader),
         SupportedFormat::Jpeg => scan_jpeg_comments(&mut reader),
-        SupportedFormat::Gif => scan_gif_comments(&mut reader),
-        SupportedFormat::WebP | SupportedFormat::Bmp | SupportedFormat::Tiff => return Ok(None),
+        SupportedFormat::WebP => return Ok(None),
     }
     .map_err(ProcessError::NativeMetadata)?;
 
@@ -476,82 +400,6 @@ fn scan_jpeg_comments(
     }
 
     Ok((comment_bytes > 0).then_some(("JPEG comment metadata", comment_bytes)))
-}
-
-/// Counts GIF comment sub-blocks while skipping palettes and image data.
-fn scan_gif_comments(reader: &mut (impl Read + Seek)) -> io::Result<Option<(&'static str, usize)>> {
-    let mut header = [0_u8; 13];
-    reader.read_exact(&mut header)?;
-    if &header[..6] != b"GIF87a" && &header[..6] != b"GIF89a" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid GIF signature",
-        ));
-    }
-    skip_gif_color_table(reader, header[10])?;
-
-    let mut comment_bytes = 0_usize;
-    loop {
-        let introducer = read_byte(reader)?;
-        match introducer {
-            0x21 => {
-                let label = read_byte(reader)?;
-                let bytes = skip_gif_sub_blocks(reader)?;
-                if label == 0xfe {
-                    comment_bytes = comment_bytes.checked_add(bytes).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "GIF comments are too large")
-                    })?;
-                }
-            }
-            0x2c => {
-                let mut descriptor = [0_u8; 9];
-                reader.read_exact(&mut descriptor)?;
-                skip_gif_color_table(reader, descriptor[8])?;
-                read_byte(reader)?;
-                skip_gif_sub_blocks(reader)?;
-            }
-            0x3b => break,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid GIF block introducer",
-                ));
-            }
-        }
-    }
-
-    Ok((comment_bytes > 0).then_some(("GIF comment metadata", comment_bytes)))
-}
-
-/// Seeks past a GIF palette when the packed flags declare one.
-fn skip_gif_color_table(reader: &mut impl Seek, packed: u8) -> io::Result<()> {
-    if packed & 0x80 != 0 {
-        let entries = 1_u16 << (u32::from(packed & 0x07) + 1);
-        reader.seek(SeekFrom::Current(i64::from(entries) * 3))?;
-    }
-    Ok(())
-}
-
-/// Skips GIF sub-block payloads and returns their total byte count.
-fn skip_gif_sub_blocks(reader: &mut (impl Read + Seek)) -> io::Result<usize> {
-    let mut total = 0_usize;
-    loop {
-        let length = usize::from(read_byte(reader)?);
-        if length == 0 {
-            return Ok(total);
-        }
-        total = total.checked_add(length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "GIF extension is too large")
-        })?;
-        reader.seek(SeekFrom::Current(length as i64))?;
-    }
-}
-
-/// Reads one required byte, reporting truncated input as an I/O error.
-fn read_byte(reader: &mut impl Read) -> io::Result<u8> {
-    let mut byte = [0_u8; 1];
-    reader.read_exact(&mut byte)?;
-    Ok(byte[0])
 }
 
 /// Reads a required big-endian JPEG segment length.
@@ -755,28 +603,6 @@ fn encode(
                 .write_image(image.as_bytes(), width, height, color)
                 .map_err(ProcessError::failure)?;
         }
-        SupportedFormat::Bmp => {
-            image::codecs::bmp::BmpEncoder::new(&mut output)
-                .write_image(image.as_bytes(), width, height, color)
-                .map_err(ProcessError::failure)?;
-        }
-        SupportedFormat::Tiff => {
-            let mut cursor = Cursor::new(&mut output);
-            let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut cursor);
-            if let Some(icc) = &metadata.icc {
-                encoder
-                    .set_icc_profile(icc.clone())
-                    .map_err(ProcessError::fidelity)?;
-            }
-            encoder
-                .write_image(image.as_bytes(), width, height, color)
-                .map_err(ProcessError::failure)?;
-        }
-        SupportedFormat::Gif => {
-            image::codecs::gif::GifEncoder::new(&mut output)
-                .write_image(image.as_bytes(), width, height, color)
-                .map_err(ProcessError::failure)?;
-        }
     }
     Ok(output)
 }
@@ -846,7 +672,7 @@ fn verify(
     }
 
     let candidate = DynamicImage::from_decoder(decoder).map_err(ProcessError::failure)?;
-    if !matches!(details.format, SupportedFormat::Jpeg | SupportedFormat::Gif)
+    if details.format != SupportedFormat::Jpeg
         && (candidate.color() != resized.color() || candidate.as_bytes() != resized.as_bytes())
     {
         return Err(ProcessError::fidelity(
@@ -894,20 +720,20 @@ fn alpha_samples_match(candidate: &DynamicImage, resized: &DynamicImage) -> bool
     match (candidate, resized) {
         (DynamicImage::ImageLumaA8(left), DynamicImage::ImageLumaA8(right)) => left
             .pixels()
-            .zip(right.pixels())
-            .all(|(left, right)| left[1] == right[1]),
+            .map(|pixel| pixel[1])
+            .eq(right.pixels().map(|pixel| pixel[1])),
         (DynamicImage::ImageRgba8(left), DynamicImage::ImageRgba8(right)) => left
             .pixels()
-            .zip(right.pixels())
-            .all(|(left, right)| left[3] == right[3]),
+            .map(|pixel| pixel[3])
+            .eq(right.pixels().map(|pixel| pixel[3])),
         (DynamicImage::ImageLumaA16(left), DynamicImage::ImageLumaA16(right)) => left
             .pixels()
-            .zip(right.pixels())
-            .all(|(left, right)| left[1] == right[1]),
+            .map(|pixel| pixel[1])
+            .eq(right.pixels().map(|pixel| pixel[1])),
         (DynamicImage::ImageRgba16(left), DynamicImage::ImageRgba16(right)) => left
             .pixels()
-            .zip(right.pixels())
-            .all(|(left, right)| left[3] == right[3]),
+            .map(|pixel| pixel[3])
+            .eq(right.pixels().map(|pixel| pixel[3])),
         _ => false,
     }
 }
@@ -918,9 +744,6 @@ fn image_format(format: SupportedFormat) -> ImageFormat {
         SupportedFormat::Jpeg => ImageFormat::Jpeg,
         SupportedFormat::Png => ImageFormat::Png,
         SupportedFormat::WebP => ImageFormat::WebP,
-        SupportedFormat::Bmp => ImageFormat::Bmp,
-        SupportedFormat::Tiff => ImageFormat::Tiff,
-        SupportedFormat::Gif => ImageFormat::Gif,
     }
 }
 
@@ -1036,19 +859,6 @@ mod tests {
         std::fs::write(path, output).unwrap();
     }
 
-    fn insert_gif_comment(path: &Path) {
-        let bytes = std::fs::read(path).unwrap();
-        let trailer = bytes.iter().rposition(|byte| *byte == 0x3b).unwrap();
-        let comment = b"native GIF comment";
-        let mut output = Vec::with_capacity(bytes.len() + comment.len() + 4);
-        output.extend_from_slice(&bytes[..trailer]);
-        output.extend_from_slice(&[0x21, 0xfe, comment.len() as u8]);
-        output.extend_from_slice(comment);
-        output.push(0);
-        output.extend_from_slice(&bytes[trailer..]);
-        std::fs::write(path, output).unwrap();
-    }
-
     #[test]
     fn creates_verified_beneficial_png_without_touching_source() {
         let directory = tempfile::tempdir().unwrap();
@@ -1116,20 +926,22 @@ mod tests {
                 .is_some()
         );
         assert!(parsed.get_field(Tag::GPSLatitudeRef, In::PRIMARY).is_none());
-        assert!(candidate.warnings.iter().any(|warning| {
-            warning.contains("GPS") && warning.contains("--preserve-all-metadata")
-        }));
+        assert!(
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("GPS"))
+        );
     }
 
     #[test]
-    fn preserve_all_rejects_native_text_metadata_that_cannot_be_reencoded() {
+    fn reports_native_text_metadata_removed_by_policy() {
         type MetadataCase = (&'static str, ImageFormat, fn(&Path));
 
         let directory = tempfile::tempdir().unwrap();
-        let cases: [MetadataCase; 3] = [
+        let cases: [MetadataCase; 2] = [
             ("text.png", ImageFormat::Png, insert_png_text_chunk),
             ("comment.jpg", ImageFormat::Jpeg, insert_jpeg_comment),
-            ("comment.gif", ImageFormat::Gif, insert_gif_comment),
         ];
 
         for (name, format, add_metadata) in cases {
@@ -1149,24 +961,10 @@ mod tests {
             add_metadata(&path);
             let details = eligible_details(&path, Bounds::new(48, 24).unwrap());
 
-            let default_outcome = process_image(&path, &details, ProcessingOptions::default());
+            let outcome = process_image(&path, &details, ProcessingOptions::default());
             assert!(
-                matches!(default_outcome, ProcessingOutcome::Reduced(ref candidate) if candidate.warnings.iter().any(|warning| warning.contains("was removed"))),
-                "expected a native metadata removal warning for {name}, got {default_outcome:?}"
-            );
-
-            let outcome = process_image(
-                &path,
-                &details,
-                ProcessingOptions {
-                    preserve_all_metadata: true,
-                    ..ProcessingOptions::default()
-                },
-            );
-
-            assert!(
-                matches!(outcome, ProcessingOutcome::FidelityConflict { ref reason } if reason.contains("text") || reason.contains("comment")),
-                "expected a native metadata fidelity conflict for {name}, got {outcome:?}"
+                matches!(outcome, ProcessingOutcome::Reduced(ref candidate) if candidate.warnings.iter().any(|warning| warning.contains("was removed"))),
+                "expected a native metadata removal warning for {name}, got {outcome:?}"
             );
         }
     }
@@ -1178,9 +976,6 @@ mod tests {
             ("photo.jpg", ImageFormat::Jpeg),
             ("photo.png", ImageFormat::Png),
             ("photo.webp", ImageFormat::WebP),
-            ("photo.bmp", ImageFormat::Bmp),
-            ("photo.tiff", ImageFormat::Tiff),
-            ("photo.gif", ImageFormat::Gif),
         ];
 
         for (name, format) in formats {
