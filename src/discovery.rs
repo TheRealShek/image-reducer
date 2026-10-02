@@ -1,3 +1,5 @@
+//! Recursive discovery with exact exclusions and no symbolic-link traversal.
+
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -5,6 +7,7 @@ use std::{
 
 use walkdir::{DirEntry, WalkDir};
 
+/// Discovery policies that intentionally leave an entry untouched.
 #[derive(Debug, Eq, PartialEq)]
 pub enum SkipReason {
     SymbolicLink,
@@ -12,6 +15,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Returns the stable report label for this skip reason.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SymbolicLink => "symbolic link",
@@ -20,18 +24,21 @@ impl SkipReason {
     }
 }
 
+/// Source-relative entry omitted by a discovery policy.
 #[derive(Debug, Eq, PartialEq)]
 pub struct SkippedEntry {
     pub relative_path: PathBuf,
     pub reason: SkipReason,
 }
 
+/// Source-relative entry that discovery could not access.
 #[derive(Debug, Eq, PartialEq)]
 pub struct AccessFailure {
     pub relative_path: PathBuf,
     pub error: String,
 }
 
+/// Sorted files, intentional skips, and access failures from one traversal.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Discovery {
     pub files: Vec<PathBuf>,
@@ -39,6 +46,7 @@ pub struct Discovery {
     pub failures: Vec<AccessFailure>,
 }
 
+/// Collects files recursively without following symlinks or entering excluded directories.
 pub fn discover(source: &Path, exclusions: &[PathBuf]) -> Discovery {
     let exclusions: HashSet<&Path> = exclusions.iter().map(PathBuf::as_path).collect();
     let mut result = Discovery {
@@ -99,6 +107,7 @@ pub fn discover(source: &Path, exclusions: &[PathBuf]) -> Discovery {
     result
 }
 
+/// Prunes exact excluded directories while allowing the traversal root.
 fn should_descend(entry: &DirEntry, source: &Path, exclusions: &HashSet<&Path>) -> bool {
     if entry.depth() == 0 {
         return true;

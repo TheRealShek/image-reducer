@@ -1,3 +1,5 @@
+//! Source-preserving image reduction with verified transactional replacement.
+
 pub mod cli;
 pub mod discovery;
 pub mod inspection;
@@ -9,6 +11,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Run-wide argument, filesystem, and JSON-report errors with their available causes.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
@@ -23,4 +26,5 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 
+/// Result type for run-wide operations.
 pub type Result<T> = std::result::Result<T, Error>;

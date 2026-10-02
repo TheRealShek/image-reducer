@@ -164,3 +164,46 @@ fn removed_metadata_option_is_rejected_without_touching_source() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("--preserve-all-metadata"));
     assert_eq!(std::fs::read(path).unwrap(), original);
 }
+
+#[test]
+fn human_and_json_preview_reports_agree_on_totals_and_failures() {
+    let parent = tempfile::tempdir().unwrap();
+    let source = parent.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    write_source(&source.join("eligible.png"));
+    RgbImage::new(1, 1).save(source.join("small.png")).unwrap();
+    std::fs::write(source.join("notes.txt"), b"not an image").unwrap();
+    std::fs::write(source.join("truncated.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+    let human = binary()
+        .arg(&source)
+        .args(["--max", "60x30", "--dry-run"])
+        .output()
+        .unwrap();
+    let json = binary()
+        .arg(&source)
+        .args(["--max", "60x30", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!human.status.success());
+    assert_eq!(human.status.code(), json.status.code());
+    let text = String::from_utf8(human.stdout).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    for (label, key, expected) in [
+        ("Reduced images", "reduced", 0),
+        ("Within-bounds images", "within_bounds", 1),
+        ("Skipped entries", "skipped", 1),
+        ("Failed images", "failed", 1),
+        ("Reduced source bytes", "source_bytes", 0),
+        ("Reduced output bytes", "output_bytes", 0),
+        ("Total bytes saved", "bytes_saved", 0),
+    ] {
+        assert_eq!(report["summary"][key], expected);
+        assert!(
+            text.lines()
+                .any(|line| line == format!("{label}: {expected}"))
+        );
+    }
+    assert!(!parent.path().join("source-reduced").exists());
+}

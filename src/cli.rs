@@ -1,3 +1,5 @@
+//! Typed command-line options and source/exclusion validation.
+
 use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
@@ -8,6 +10,7 @@ use clap::{Parser, ValueHint};
 
 use crate::{Error, Result, plan::Bounds};
 
+/// Command-line options for one source tree and its reduction policy.
 #[derive(Debug, Parser)]
 #[command(
     name = "image-reducer",
@@ -67,6 +70,7 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Rejects sources that are not real directories.
     pub fn validate(&self) -> Result<()> {
         let metadata = std::fs::metadata(&self.source).map_err(|source| Error::Io {
             path: self.source.clone(),
@@ -90,6 +94,7 @@ impl Cli {
     }
 }
 
+/// Rejects empty, absolute, or escaping source-relative exclusions.
 pub(crate) fn validate_exclusion(path: &std::path::Path) -> Result<()> {
     use std::path::Component;
 

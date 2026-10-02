@@ -1,3 +1,5 @@
+//! Color-aware resizing, metadata policy, encoding, and candidate verification.
+
 use std::{
     fs::File,
     io::{self, BufReader, Cursor, Read, Seek, SeekFrom},
@@ -12,12 +14,14 @@ use image::{
 };
 use img_parts::{DynImage, ImageEXIF, ImageICC};
 use moxcms::{ColorProfile, Layout, TransformOptions};
+use thiserror::Error;
 
 use crate::inspection::{Dimensions, ImageDetails, SupportedFormat};
 
 pub const DEFAULT_JPEG_QUALITY: u8 = 92;
 pub const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
+/// JPEG encoding quality for the fixed capture-date and ICC retention policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessingOptions {
     pub jpeg_quality: u8,
@@ -31,6 +35,7 @@ impl Default for ProcessingOptions {
     }
 }
 
+/// Encoded reduction that passed verification; size benefit is checked before acceptance.
 #[derive(Debug)]
 pub struct Candidate {
     pub bytes: Vec<u8>,
@@ -41,11 +46,13 @@ pub struct Candidate {
 }
 
 impl Candidate {
+    /// Returns the size reduction; call only for a beneficial candidate.
     pub fn bytes_saved(&self) -> u64 {
         self.source_bytes - self.bytes.len() as u64
     }
 }
 
+/// Per-file processing result before any candidate is published.
 #[derive(Debug)]
 pub enum ProcessingOutcome {
     Reduced(Candidate),
@@ -54,6 +61,7 @@ pub enum ProcessingOutcome {
     Failed { error: String },
 }
 
+/// Bounded capture-date and ICC metadata selected for encoding.
 #[derive(Default)]
 struct Metadata {
     icc: Option<Vec<u8>>,
@@ -61,6 +69,7 @@ struct Metadata {
     warnings: Vec<String>,
 }
 
+/// Builds and verifies a candidate without modifying the source file.
 pub fn process_image(
     path: &Path,
     details: &ImageDetails,
@@ -73,26 +82,47 @@ pub fn process_image(
             }
         }
         Ok(candidate) => ProcessingOutcome::Reduced(candidate),
-        Err(ProcessError::Fidelity(reason)) => ProcessingOutcome::FidelityConflict { reason },
-        Err(ProcessError::Failure(error)) => ProcessingOutcome::Failed { error },
+        Err(
+            error @ (ProcessError::Fidelity(_)
+            | ProcessError::InvalidIcc(_)
+            | ProcessError::Exif(_)),
+        ) => ProcessingOutcome::FidelityConflict {
+            reason: error.to_string(),
+        },
+        Err(error) => ProcessingOutcome::Failed {
+            error: error.to_string(),
+        },
     }
 }
 
+/// Processing failures retain their causes until conversion into a per-file report.
+#[derive(Debug, Error)]
 enum ProcessError {
-    Fidelity(String),
-    Failure(String),
+    #[error("{0}")]
+    Fidelity(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Failure(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("invalid ICC profile: {0}")]
+    InvalidIcc(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("cannot inspect native text metadata: {0}")]
+    NativeMetadata(#[source] io::Error),
+    #[error("cannot parse EXIF metadata: {0}")]
+    Exif(#[source] exif::Error),
 }
 
 impl ProcessError {
-    fn fidelity(error: impl ToString) -> Self {
-        Self::Fidelity(error.to_string())
+    /// Classifies an encoder or policy conflict without discarding its cause.
+    fn fidelity(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Fidelity(error.into())
     }
 
-    fn failure(error: impl ToString) -> Self {
-        Self::Failure(error.to_string())
+    /// Classifies a processing failure without discarding its cause.
+    fn failure(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Failure(error.into())
     }
 }
 
+/// Normalizes orientation and color, resizes, encodes, and verifies a source.
 fn process_image_inner(
     path: &Path,
     details: &ImageDetails,
@@ -137,7 +167,7 @@ fn process_image_inner(
         .as_deref()
         .map(ColorProfile::new_from_slice)
         .transpose()
-        .map_err(|error| ProcessError::fidelity(format!("invalid ICC profile: {error}")))?;
+        .map_err(|error| ProcessError::InvalidIcc(error.into()))?;
     if let Some(profile) = &source_profile {
         image = transform_profile(&image, profile, &ColorProfile::new_srgb())?;
     }
@@ -174,6 +204,7 @@ fn process_image_inner(
     })
 }
 
+/// Rejects color representations the source format cannot safely re-encode.
 fn ensure_supported_color(
     color: ExtendedColorType,
     format: SupportedFormat,
@@ -217,6 +248,7 @@ fn ensure_supported_color(
     Ok(())
 }
 
+/// Applies size limits, retains capture date and ICC, and reports discarded metadata.
 fn read_metadata(
     decoder: &mut impl ImageDecoder,
     native_text: Option<&'static str>,
@@ -263,6 +295,7 @@ fn read_metadata(
     })
 }
 
+/// Detects native comments/text and enforces their independent size limit.
 fn read_native_text_metadata(
     file: &mut File,
     format: SupportedFormat,
@@ -273,9 +306,7 @@ fn read_native_text_metadata(
         SupportedFormat::Jpeg => scan_jpeg_comments(&mut reader),
         SupportedFormat::WebP => return Ok(None),
     }
-    .map_err(|error| {
-        ProcessError::failure(format!("cannot inspect native text metadata: {error}"))
-    })?;
+    .map_err(ProcessError::NativeMetadata)?;
 
     if let Some((description, bytes)) = found {
         if bytes > MAX_METADATA_BYTES {
@@ -289,6 +320,7 @@ fn read_native_text_metadata(
     Ok(None)
 }
 
+/// Counts native PNG text payloads without allocating or decompressing them.
 fn scan_png_text_chunks(
     reader: &mut (impl Read + Seek),
 ) -> io::Result<Option<(&'static str, usize)>> {
@@ -320,6 +352,7 @@ fn scan_png_text_chunks(
     Ok((text_bytes > 0).then_some(("PNG text metadata", text_bytes)))
 }
 
+/// Counts JPEG comment payloads before the compressed image scan.
 fn scan_jpeg_comments(
     reader: &mut (impl Read + Seek),
 ) -> io::Result<Option<(&'static str, usize)>> {
@@ -369,18 +402,21 @@ fn scan_jpeg_comments(
     Ok((comment_bytes > 0).then_some(("JPEG comment metadata", comment_bytes)))
 }
 
+/// Reads a required big-endian JPEG segment length.
 fn read_u16_be(reader: &mut impl Read) -> io::Result<u16> {
     let mut bytes = [0_u8; 2];
     reader.read_exact(&mut bytes)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
+/// Reads a required big-endian PNG chunk length.
 fn read_u32_be(reader: &mut impl Read) -> io::Result<u32> {
     let mut bytes = [0_u8; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_be_bytes(bytes))
 }
 
+/// Rejects metadata that exceeds the independent per-payload limit.
 fn check_metadata_size(name: &str, metadata: Option<&[u8]>) -> Result<(), ProcessError> {
     if metadata.is_some_and(|bytes| bytes.len() > MAX_METADATA_BYTES) {
         return Err(ProcessError::fidelity(format!(
@@ -391,10 +427,11 @@ fn check_metadata_size(name: &str, metadata: Option<&[u8]>) -> Result<(), Proces
     Ok(())
 }
 
+/// Extracts capture date into minimal EXIF without retaining GPS or other fields.
 fn capture_date_exif(raw: &[u8]) -> Result<Option<Vec<u8>>, ProcessError> {
     let parsed = exif::Reader::new()
         .read_raw(raw.to_vec())
-        .map_err(|error| ProcessError::fidelity(format!("cannot parse EXIF metadata: {error}")))?;
+        .map_err(ProcessError::Exif)?;
     let date = parsed
         .get_field(Tag::DateTimeOriginal, In::PRIMARY)
         .and_then(|field| match &field.value {
@@ -404,6 +441,7 @@ fn capture_date_exif(raw: &[u8]) -> Result<Option<Vec<u8>>, ProcessError> {
     Ok(date.map(|date| build_capture_date_exif(&date)))
 }
 
+/// Constructs a little-endian EXIF directory containing only the capture date.
 fn build_capture_date_exif(date: &[u8]) -> Vec<u8> {
     let mut date = date.to_vec();
     if !date.ends_with(&[0]) {
@@ -433,14 +471,17 @@ fn build_capture_date_exif(date: &[u8]) -> Vec<u8> {
     exif
 }
 
+/// Appends a little-endian EXIF integer.
 fn push_u16(output: &mut Vec<u8>, value: u16) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Appends a little-endian EXIF integer.
 fn push_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+/// Allocates target pixels with the source channel layout and bit depth.
 fn new_image_like(
     source: &DynamicImage,
     width: u32,
@@ -464,6 +505,7 @@ fn new_image_like(
     Ok(image)
 }
 
+/// Transforms RGB/RGBA pixels between ICC profiles without changing their layout.
 fn transform_profile(
     image: &DynamicImage,
     source: &ColorProfile,
@@ -523,6 +565,7 @@ fn transform_profile(
     })
 }
 
+/// Encodes resized pixels in the source format with the selected metadata.
 fn encode(
     image: &DynamicImage,
     format: SupportedFormat,
@@ -564,6 +607,7 @@ fn encode(
     Ok(output)
 }
 
+/// Supplies retained ICC and EXIF bytes to an encoder that takes ownership.
 fn set_metadata(encoder: &mut impl ImageEncoder, metadata: &Metadata) -> Result<(), ProcessError> {
     if let Some(icc) = &metadata.icc {
         encoder
@@ -578,6 +622,7 @@ fn set_metadata(encoder: &mut impl ImageEncoder, metadata: &Metadata) -> Result<
     Ok(())
 }
 
+/// Round-trips a candidate and checks dimensions, orientation, metadata, and pixel fidelity.
 fn verify(
     bytes: &[u8],
     details: &ImageDetails,
@@ -642,6 +687,7 @@ fn verify(
     Ok(())
 }
 
+/// Checks ICC/EXIF retention independently through container parsing.
 fn verify_container_metadata(
     bytes: &[u8],
     format: SupportedFormat,
@@ -669,6 +715,7 @@ fn verify_container_metadata(
     Ok(())
 }
 
+/// Compares matching alpha-channel layouts without allocating sample arrays.
 fn alpha_samples_match(candidate: &DynamicImage, resized: &DynamicImage) -> bool {
     match (candidate, resized) {
         (DynamicImage::ImageLumaA8(left), DynamicImage::ImageLumaA8(right)) => left
@@ -691,6 +738,7 @@ fn alpha_samples_match(candidate: &DynamicImage, resized: &DynamicImage) -> bool
     }
 }
 
+/// Maps a supported format to its codec format identifier.
 fn image_format(format: SupportedFormat) -> ImageFormat {
     match format {
         SupportedFormat::Jpeg => ImageFormat::Jpeg,
@@ -711,6 +759,37 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn truncated_native_metadata_retains_io_cause() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"\x89PNG").unwrap();
+        file.rewind().unwrap();
+
+        let error = read_native_text_metadata(&mut file, SupportedFormat::Png).unwrap_err();
+        let cause = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(cause.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            error.to_string(),
+            format!("cannot inspect native text metadata: {cause}")
+        );
+    }
+
+    #[test]
+    fn invalid_exif_retains_parser_cause() {
+        let error = capture_date_exif(b"invalid EXIF").unwrap_err();
+        let cause = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<exif::Error>()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("cannot parse EXIF metadata: {cause}")
+        );
+    }
 
     fn eligible_details(path: &Path, bounds: Bounds) -> ImageDetails {
         let source = path.parent().unwrap();
